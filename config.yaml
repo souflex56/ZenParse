@@ -1,0 +1,19 @@
+pdf_parsing:
+  # 解析策略：
+  # - auto        自动选择最合适的解析引擎（默认优先使用 pdfplumber，必要时回退到其他引擎）
+  # - pdfplumber  只使用 pdfplumber（速度快、对电子版财报效果好）
+  # - unstructured 使用 unstructured 的高分辨率解析（适合复杂/扫描版，但较慢）
+  # - hybrid_table 启用高级表格检测与结构化（最慢，仅在特别需要表格结构时建议开启）
+  strategies:
+    - pdfplumber
+
+context:
+  context_before: 10
+  context_after: 3
+
+chunking:
+  parent_size: 4000
+  child_size: 1200
+  overlap: 200
+  min_chunk_size: 50
+  min_quality_score: 0.3

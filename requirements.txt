@@ -1,0 +1,10 @@
+unstructured
+pdfplumber
+pymupdf
+loguru
+torch
+psutil
+opencv-python-headless
+pandas
+unstructured-inference
+detectron2
