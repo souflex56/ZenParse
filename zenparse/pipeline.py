@@ -6,6 +6,7 @@
 
 from typing import Dict, List, Tuple, Union
 import os
+import re
 import yaml
 
 from .core.logger import get_logger
@@ -14,6 +15,7 @@ from .data.pdf_parser import ChineseFinancialPDFParser
 from .data.context_identifier import ChineseFinancialContextIdentifier
 from .data.smart_chunker import ChineseFinancialChunker
 from .data.models import ParentChunk, ChildChunk, TableGroup
+from .data.standards_detector import StandardsDetector
 
 
 class ZenPipeline:
@@ -31,6 +33,8 @@ class ZenPipeline:
             self.parser = ChineseFinancialPDFParser(parser_config)
             self.context_identifier = ChineseFinancialContextIdentifier(context_config)
             self.chunker = ChineseFinancialChunker(chunking_config)
+            self.standards_detector = StandardsDetector(self.config)
+            self.last_standards_profile = None
         except Exception as exc:
             raise ZenParseError(f"组件初始化失败: {exc}") from exc
 
@@ -61,6 +65,29 @@ class ZenPipeline:
 
         return dict(self.config)
 
+    def _infer_fiscal_year(
+        self,
+        parent_chunks: List[ParentChunk],
+        child_chunks: List[ChildChunk],
+        pdf_path: str,
+    ) -> Union[int, None]:
+        """从分块或文件名推断财年"""
+        for chunk in parent_chunks + child_chunks:
+            if getattr(chunk, "metadata", None) and getattr(chunk.metadata, "fiscal_year", None):
+                try:
+                    return int(chunk.metadata.fiscal_year)
+                except (TypeError, ValueError):
+                    continue
+
+        # 文件名兜底：匹配 20xx
+        m = re.search(r"(20\\d{2})", os.path.basename(pdf_path))
+        if m:
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def process(self, pdf_path: str) -> Tuple[List[ParentChunk], List[ChildChunk], List[TableGroup]]:
         """处理单个 PDF，返回父子分块与表格组"""
         if not os.path.exists(pdf_path):
@@ -76,5 +103,9 @@ class ZenPipeline:
         parent_chunks, child_chunks = self.chunker.create_chunks(
             elements=elements, table_groups=table_groups, source_file=pdf_path
         )
+
+        # 准则判定（不改变返回结构，将结果保存在实例属性中）
+        fiscal_year = self._infer_fiscal_year(parent_chunks, child_chunks, pdf_path)
+        self.last_standards_profile = self.standards_detector.detect(elements, fiscal_year)
 
         return parent_chunks, child_chunks, table_groups

@@ -60,6 +60,13 @@ class ChunkType(Enum):
     SECTION = "section"
 
 
+class StandardFlag(str, Enum):
+    """会计准则执行状态"""
+    OLD = "old"
+    NEW = "new"
+    UNKNOWN = "unknown"
+
+
 class TableType(Enum):
     """表格类型 - 针对财报"""
     FINANCIAL_STATEMENT = "financial_statement"  # 财务报表
@@ -202,6 +209,8 @@ class ChunkMetadata(BaseModel):
     readability_score: float = 0.0
     information_density: float = 0.0
     coherence_score: float = 0.0
+    # 准则摘要（可选，用于检索加权）
+    standards_profile_summary: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -514,6 +523,15 @@ class ProcessingStats(BaseModel):
                 "时间期间数": self.time_periods_identified
             }
         }
+
+
+@dataclass
+class StandardsProfile(BaseModel):
+    """会计准则执行情况（报表级）"""
+    revenue: StandardFlag = StandardFlag.UNKNOWN
+    financial_instruments: StandardFlag = StandardFlag.UNKNOWN
+    lease: StandardFlag = StandardFlag.UNKNOWN
+    decided_by: str = "unknown"  # explicit_note / table_keywords / year_threshold / mixed
 
 
 @dataclass

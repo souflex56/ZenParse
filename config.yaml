@@ -17,3 +17,16 @@ chunking:
   overlap: 200
   min_chunk_size: 50
   min_quality_score: 0.3
+
+standards_detection:
+  enabled: true
+  # 仅在此时间窗内启用精细检测
+  transition_start_year: 2017
+  transition_end_year: 2021
+  # 过渡期内部阈值（用于年份兜底）
+  revenue_new_threshold_year: 2019
+  financial_new_threshold_year: 2019
+  lease_new_threshold_year: 2021
+  # 时间窗外默认策略
+  default_before_transition: old
+  default_after_transition: new
