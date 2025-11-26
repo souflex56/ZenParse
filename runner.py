@@ -337,6 +337,13 @@ def process_batch(
             parents, children, table_groups = pipeline.process(pdf_path)
 
             overview = _build_overview(parents, children, table_groups, file_name)
+            # 报表级会计准则执行情况（若已计算）
+            profile = getattr(pipeline, "last_standards_profile", None)
+            if profile:
+                try:
+                    overview["accounting_standards"] = profile.to_dict()
+                except Exception:
+                    overview["accounting_standards"] = getattr(profile, "__dict__", {})
 
             result_data = {
                 "source": file_name,

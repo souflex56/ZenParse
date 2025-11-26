@@ -434,7 +434,11 @@ class HybridTableProcessor:
                         
                         # 解析表格结构
                         raw_data = self._parse_table_structure(table_content)
-                        if not raw_data or len(raw_data) < 2:
+                        if not raw_data:
+                            continue
+                        if not self._is_valid_single_cell_table(raw_data):
+                            continue
+                        if len(raw_data) < 2:
                             continue
                         
                         # 获取边界框
@@ -594,6 +598,9 @@ class HybridTableProcessor:
                     
                     # 尝试解析表格结构
                     raw_data = self._parse_table_structure(content)
+                    if raw_data and not self._is_valid_single_cell_table(raw_data):
+                        # 过滤误判的单单元格/单行表格
+                        continue
                     
                     table_elem = TableElement(
                         content=content,
@@ -618,6 +625,37 @@ class HybridTableProcessor:
         
         return tables
     
+    def _is_valid_single_cell_table(self, table_data: List[List]) -> bool:
+        """检查单行/单列表格是否为有效表格，过滤长句伪表格"""
+        if not table_data or not table_data[0]:
+            return False
+        
+        rows = len(table_data)
+        cols = len(table_data[0])
+        
+        # 多行多列表格直接视为有效
+        if rows > 1 and cols > 1:
+            return True
+        
+        # 聚合文本内容
+        if rows == 1 and cols == 1:
+            content = str(table_data[0][0] or "")
+        elif rows == 1:
+            content = "".join(str(c or "") for c in table_data[0])
+        elif cols == 1:
+            content = "".join(str(r[0] or "") for r in table_data)
+        else:
+            # 行>1但列数为0的异常情况，拼接全部单元格
+            content = "".join("".join(str(c or "") for c in row) for row in table_data)
+        
+        content = content.strip()
+        
+        # 长文本且包含标点，极大概率是叙述性文本
+        if len(content) > 50 and any(p in content for p in ['，', '。', '；', '!', '?', ';']):
+            return False
+        
+        return True
+
     def _clean_table_data(self, table_data: List[List]) -> List[List]:
         """清理表格数据"""
         cleaned = []
@@ -638,6 +676,10 @@ class HybridTableProcessor:
                     cleaned_row.append(cell_str)
             
             cleaned.append(cleaned_row)
+        
+        # 对窄表格进行有效性校验，过滤误识别的长文本
+        if cleaned and not self._is_valid_single_cell_table(cleaned):
+            return []
         
         return cleaned
     

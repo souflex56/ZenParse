@@ -14,6 +14,11 @@ from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 
 from .models import DocumentElement, ElementType
+from .accounting_domain import (
+    STANDARD_ACCOUNTING_ITEMS,
+    FINANCIAL_REPORT_SECTIONS,
+    NON_ACCOUNTING_KEYWORDS,
+)
 from ..core.logger import get_logger
 from ..core.enhanced_device_manager import EnhancedDeviceManager
 from .engine_checker import (
@@ -48,9 +53,11 @@ if is_engine_available('pdfplumber'):
     except ImportError:
         pass
 
+PYMUPDF_AVAILABLE = False
 if is_engine_available('pymupdf'):
     try:
         import fitz  # PyMuPDF
+        PYMUPDF_AVAILABLE = True
     except ImportError:
         pass
 
@@ -256,11 +263,14 @@ class ChinesePDFParser:
         
         # 检查是否为表格（基于元数据或内容特征）
         if metadata and metadata.get('element_type') == 'Table':
-            return ElementType.TABLE
+            # 验证是否具有真实表格结构，否则降级为文本
+            if self._is_valid_table_structure(content):
+                return ElementType.TABLE
         
         # 检查表格特征（多个制表符或竖线）
         if content.count('\t') > 3 or content.count('|') > 3:
-            return ElementType.TABLE
+            if self._is_valid_table_structure(content):
+                return ElementType.TABLE
         
         # 检查是否为列表
         if re.match(r'^[\(（]\d+[\)）]', content) or re.match(r'^[•·▪▫◦‣⁃]', content):
@@ -268,6 +278,27 @@ class ChinesePDFParser:
         
         # 默认为文本
         return ElementType.TEXT
+
+    def _is_valid_table_structure(self, content: str) -> bool:
+        """验证内容是否具有表格结构特征"""
+        if not content:
+            return False
+        
+        lines = [ln for ln in content.strip().split('\n') if ln.strip()]
+        if len(lines) < 2:
+            return False
+        
+        # 统计分隔符数量
+        tab_counts = [ln.count('\t') for ln in lines]
+        pipe_counts = [ln.count('|') for ln in lines]
+        
+        has_consistent_tabs = tab_counts and min(tab_counts) > 0 and (max(tab_counts) - min(tab_counts)) <= 2
+        has_consistent_pipes = pipe_counts and min(pipe_counts) > 1 and (max(pipe_counts) - min(pipe_counts)) <= 2
+        
+        # 是否存在典型数字列模式
+        has_numeric_pattern = bool(re.search(r'\d[\d,\.]+\s+\d[\d,\.]+', content))
+        
+        return has_consistent_tabs or has_consistent_pipes or has_numeric_pattern
 
 
 class SmartPDFParser(ChinesePDFParser):
@@ -1059,7 +1090,7 @@ class SmartPDFParser(ChinesePDFParser):
         return paragraphs
     
     def _identify_financial_statements(self, elements: List[DocumentElement]) -> List[DocumentElement]:
-        """识别财务报表"""
+        """识别财务报表 - 仅添加元数据标记，不改变元素类型"""
         for elem in elements:
             content_preview = elem.content[:200] if elem.content else ""
             
@@ -1068,11 +1099,7 @@ class SmartPDFParser(ChinesePDFParser):
                 if statement_name in content_preview:
                     elem.metadata['financial_statement'] = statement_name
                     elem.report_section = statement_name
-                    
-                    # 如果是已知的财务报表，更新类型
-                    if '表' in statement_name and elem.element_type != ElementType.TABLE:
-                        elem.element_type = ElementType.TABLE
-                    
+                    # 不再强制转换类型，信任 PDF 解析器的原生分类
                     break
         
         return elements
@@ -1086,33 +1113,7 @@ class ChineseFinancialPDFParser(SmartPDFParser):
         super().__init__(config)  # 复用智能解析器
         
         # 保留重要的财报配置 - 不要删除业务逻辑
-        self.report_sections = [
-            # 前言及摘要类
-            '释义',
-            '重要提示', 
-            '公司简介',
-            '会计数据和财务指标摘要',
-            
-            # 管理层讨论与分析类
-            '公司业务概要',
-            '经营情况讨论与分析',
-            '董事会报告',
-            '重要事项',
-            
-            # 公司治理及股权信息类
-            '股份变动及股东情况',
-            '普通股股份变动及股东情况',
-            '优先股相关情况',
-            '董事、监事、高级管理人员和员工情况',
-            '公司治理',
-            '内部控制',
-            '债券相关情况',
-            
-            # 财务和审计结论
-            '财务报告',
-            '审计报告',
-            '备查文件目录'
-        ]
+        self.report_sections = FINANCIAL_REPORT_SECTIONS
         
         # 会计科目模式（保留关键业务逻辑）
         self.accounting_item_patterns = [
@@ -1123,72 +1124,10 @@ class ChineseFinancialPDFParser(SmartPDFParser):
         ]
         
         # 会计科目关键词库 - 采用"全称+简称+衍生词"策略
-        self.accounting_keywords = [
-            # 资产负债表 - 流动资产
-            '货币资金', '现金', '银行存款', '库存现金', '现金等价物',
-            '应收票据', '应收账款', '应收账款融资', '应收款项融资',
-            '预付款项', '预付账款', '其他应收款', '长期应收款',
-            '存货', '合同资产', '交易性金融资产', '其他流动资产',
-            
-            # 资产负债表 - 非流动资产
-            '长期股权投资', '投资性房地产', '固定资产', '在建工程', '工程物资',
-            '无形资产', '开发支出', '长期待摊费用', '商誉',
-            '使用权资产', '递延所得税资产', '持有待售资产',
-            
-            # 资产负债表 - 流动负债
-            '短期借款', '应付票据', '应付账款', '预收款项', '预收账款',
-            '合同负债', '应付职工薪酬', '应交税费', '应付利息', '应付股利',
-            '其他应付款', '吸收存款', '拆入资金', '一年内到期的非流动负债', '租赁负债',
-            
-            # 资产负债表 - 非流动负债
-            '长期借款', '应付债券', '长期应付款', '递延收益',
-            '递延所得税负债', '预计负债',
-            
-            # 资产负债表 - 所有者权益
-            '实收资本', '股本', '资本公积', '盈余公积', '未分配利润',
-            '库存股', '少数股东权益', '其他权益工具',
-            
-            # 利润表 - 收入
-            '营业收入', '营业总收入', '主营业务收入', '其他业务收入',
-            
-            # 利润表 - 成本费用
-            '营业成本', '主营业务成本', '销售费用', '管理费用', '财务费用', '研发费用',
-            
-            # 利润表 - 损益
-            '营业外收入', '营业外支出', '资产减值损失', '信用减值损失',
-            '公允价值变动损益', '投资收益',
-            
-            # 利润表 - 利润（含全称、简称、衍生词）
-            '利润总额', '净利润', '归属于母公司所有者的净利润', '归属于母公司股东的净利润',
-            '归属于上市公司股东净利润', '归母净利润', '归母净利', '少数股东损益',
-            
-            # 利润表 - 每股收益
-            '基本每股收益', '稀释每股收益', '每股收益',
-            
-            # 利润表 - 税费
-            '所得税费用', '所得税',
-            
-            # 利润表 - 其他
-            '其他综合收益', '综合收益总额',
-            
-            # 现金流量表
-            '经营活动产生的现金流量', '经营活动现金流',
-            '投资活动产生的现金流量', '投资活动现金流',
-            '筹资活动产生的现金流量', '筹资活动现金流',
-            '汇率变动对现金及现金等价物的影响', '现金及现金等价物净增加额', '现金及现金等价物'
-        ]
+        self.accounting_keywords = STANDARD_ACCOUNTING_ITEMS
         
         # 非会计科目关键词库
-        self.non_accounting_keywords = [
-            # 财报章节名称
-            '释义', '重要提示', '公司简介', '公司基本情况', '董事会报告', '重要事项',
-            '审计报告', '内部控制', '公司治理', '备查文件目录', '股份变动', '股东情况',
-            '经营情况讨论与分析', '公司业务概要', '优先股相关情况', '债券相关情况', '普通股股份变动',
-            
-            # 描述性概念
-            '公允价值', '折旧', '摊销', '减值准备', '预期信用损失', '母公司', '合并报表',
-            '关联交易', '利润分配', '股本', '现金流', '财务指标'
-        ]
+        self.non_accounting_keywords = NON_ACCOUNTING_KEYWORDS
         
         # 财报特定质量阈值
         self.chinese_config = {
@@ -1207,6 +1146,10 @@ class ChineseFinancialPDFParser(SmartPDFParser):
         elements = super().parse(pdf_path)
         
         # 财报特定后处理
+        # 1) 清理页眉/页脚等重复噪声，避免污染分块和预览
+        elements = self._clean_header_footer_noise(elements)
+        # 2) 合并跨页或被硬断开的连续段落
+        elements = self._merge_cross_page_paragraphs(elements)
         # 提取报告元数据
         elements = self._extract_report_metadata(elements)
         # 识别会计科目
@@ -1216,6 +1159,145 @@ class ChineseFinancialPDFParser(SmartPDFParser):
         
         return elements
     
+    def _is_chinese_char(self, char: str) -> bool:
+        """判断是否为中文字符"""
+        if not char:
+            return False
+        return '\u4e00' <= char <= '\u9fff'
+
+    def _merge_cross_page_paragraphs(
+        self,
+        elements: List[DocumentElement]
+    ) -> List[DocumentElement]:
+        """合并跨页或同页被硬断开的段落"""
+        if not elements:
+            return []
+
+        merged_elements: List[DocumentElement] = []
+        current_element: Optional[DocumentElement] = None
+
+        for elem in elements:
+            if current_element is None:
+                current_element = elem
+                continue
+
+            should_merge = False
+
+            if (current_element.element_type == ElementType.TEXT and
+                    elem.element_type == ElementType.TEXT):
+
+                # 只合并同页或相邻页
+                if elem.page_number <= current_element.page_number + 1:
+                    prev_text = current_element.content.strip()
+                    curr_text = elem.content.strip()
+
+                    if prev_text and curr_text:
+                        last_char = prev_text[-1]
+                        first_char = curr_text[0]
+
+                        is_sentence_end = last_char in ['。', '！', '？', '!', '?', ':', '：', ';', '；']
+
+                        is_list_item = (
+                            re.match(r'^[\(（]\d+[\)）]', curr_text) or
+                            re.match(r'^[\(（][一二三四五六七八九十]+[\)）]', curr_text) or
+                            re.match(r'^\d+\.', curr_text) or
+                            first_char in ['•', '·', '▪', '▫', '◦', '‣', '⁃']
+                        )
+
+                        if not is_sentence_end and not is_list_item:
+                            if self._is_chinese_char(last_char) and self._is_chinese_char(first_char):
+                                should_merge = True
+                            elif (last_char.isalnum() or last_char == '-') and first_char.isalnum():
+                                should_merge = True
+
+            if should_merge:
+                prev_text_stripped = current_element.content.strip()
+
+                # 英文连字符换行：去掉末尾 '-' 再拼接
+                if (len(prev_text_stripped) >= 2 and
+                        prev_text_stripped.endswith('-') and
+                        not self._is_chinese_char(prev_text_stripped[-2])):
+                    current_element.content = prev_text_stripped[:-1] + elem.content.strip()
+                else:
+                    sep = "" if self._is_chinese_char(prev_text_stripped[-1]) else " "
+                    current_element.content = current_element.content + sep + elem.content.strip()
+
+                # 合并 bbox
+                if current_element.bbox and elem.bbox:
+                    current_element.bbox = (
+                        min(current_element.bbox[0], elem.bbox[0]),
+                        min(current_element.bbox[1], elem.bbox[1]),
+                        max(current_element.bbox[2], elem.bbox[2]),
+                        max(current_element.bbox[3], elem.bbox[3])
+                    )
+
+                # 记录跨页 page_numbers
+                if elem.page_number != current_element.page_number:
+                    meta = current_element.metadata
+                    pages = meta.get('page_numbers') or [current_element.page_number]
+                    if elem.page_number not in pages:
+                        pages.append(elem.page_number)
+                    meta['page_numbers'] = sorted(set(pages))
+
+            else:
+                merged_elements.append(current_element)
+                current_element = elem
+
+        if current_element:
+            merged_elements.append(current_element)
+
+        return merged_elements
+
+    def _clean_header_footer_noise(self, elements: List[DocumentElement]) -> List[DocumentElement]:
+        """清理页眉、页脚及常见噪声元素"""
+        cleaned_elements = []
+        
+        # 整块噪声模式（严格匹配整行）
+        noise_patterns = [
+            r'^\*?[\u4e00-\u9fffA-Za-z0-9（）()·"""、\\s-]{0,80}年度报告全文\s*$',
+            r'^\d+\s*$',
+            r'^\d+\s*[/／]\s*\d+\s*$',
+            r'^第\s*\d+\s*页\s*$',
+            r'^共\s*\d+\s*页\s*$',
+        ]
+        compiled_noise = [re.compile(p) for p in noise_patterns]
+        
+        # 页眉前缀（当页眉粘在正文前部时）
+        header_prefix = re.compile(r'^\*?[^\n]{0,80}年度报告全文[\s\n]*')
+        
+        for elem in elements:
+            content = (elem.content or "").strip()
+            if not content:
+                continue
+            
+            # 利用解析元数据直接过滤 Header/Footer
+            if isinstance(elem.metadata, dict):
+                if elem.metadata.get('element_type') in ['Header', 'Footer']:
+                    continue
+            
+            # 整块匹配噪声直接丢弃
+            if any(pattern.match(content) for pattern in compiled_noise):
+                continue
+            
+            # 去除粘在正文前面的页眉前缀
+            stripped = header_prefix.sub('', content)
+            if stripped != content:
+                elem.content = stripped.strip()
+            
+            if elem.content:
+                cleaned_elements.append(elem)
+        
+        # 额外清理：移除残留的 * 前缀（PDF 格式伪影）
+        for elem in cleaned_elements:
+            content = elem.content
+            if content and content.startswith('*') and len(content) > 1:
+                # 当 * 后面直接跟中文、特殊符号或数字时，移除 *
+                next_char = content[1]
+                if next_char in '（□√一二三四五六七八九十-0123456789' or '\u4e00' <= next_char <= '\u9fff':
+                    elem.content = content[1:].strip()
+        
+        return cleaned_elements
+    
     def _extract_report_metadata(self, elements: List[DocumentElement]) -> List[DocumentElement]:
         """提取报告元数据"""
         for elem in elements:
@@ -1224,6 +1306,22 @@ class ChineseFinancialPDFParser(SmartPDFParser):
             company_match = re.search(company_pattern, elem.content)
             if company_match:
                 elem.company_name = company_match.group(1)
+            
+            # 提取股票代码（6位数字，常见于 A 股）
+            # 支持格式: 300617、(300617)、（300617）、股票代码：300617
+            stock_code_patterns = [
+                r'(?:股票代码|证券代码)[：:\s]*(\d{6})',  # 股票代码：300617
+                r'[（(](\d{6})[)）]',                    # (300617) 或 （300617）
+                r'(?<![0-9])(\d{6})(?![0-9])',          # 独立的6位数字
+            ]
+            for pattern in stock_code_patterns:
+                code_match = re.search(pattern, elem.content)
+                if code_match:
+                    code = code_match.group(1)
+                    # 验证是有效的股票代码范围
+                    if code.startswith(('0', '3', '6', '8')):  # 主板、创业板、科创板
+                        elem.stock_code = code
+                        break
             
             # 提取财务期间
             year_pattern = r'(\d{4})\s*年'

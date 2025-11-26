@@ -1,0 +1,18 @@
+"""Accounting domain knowledge shared across parsers."""
+
+# Re-export for convenience
+from .constants import (
+    STANDARD_ACCOUNTING_ITEMS,
+    BROAD_ACCOUNTING_CATEGORIES,
+    COMMON_ACCOUNTING_ITEMS,
+    FINANCIAL_REPORT_SECTIONS,
+    NON_ACCOUNTING_KEYWORDS,
+)
+
+__all__ = [
+    "STANDARD_ACCOUNTING_ITEMS",
+    "BROAD_ACCOUNTING_CATEGORIES",
+    "COMMON_ACCOUNTING_ITEMS",
+    "FINANCIAL_REPORT_SECTIONS",
+    "NON_ACCOUNTING_KEYWORDS",
+]

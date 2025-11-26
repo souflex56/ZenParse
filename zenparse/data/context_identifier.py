@@ -10,6 +10,11 @@ from typing import List, Optional, Dict, Any, Tuple
 from collections import defaultdict
 
 from .models import DocumentElement, TableGroup, ElementType, TableType
+from .accounting_domain import (
+    STANDARD_ACCOUNTING_ITEMS,
+    BROAD_ACCOUNTING_CATEGORIES,
+    COMMON_ACCOUNTING_ITEMS,
+)
 
 
 class TableContextIdentifier:
@@ -332,15 +337,25 @@ class TableContextIdentifier:
         return '\n\n'.join(parts)
     
     def _clean_table_content(self, content: str) -> str:
-        """清理表格内容，去除乱码"""
+        """清理表格内容，去除乱码和噪声"""
         if not content:
             return content
         
-        # 移除常见的乱码模式
         cleaned = content
         
+        # 移除页眉/页脚等重复噪声（防止混入表格内容）
+        header_pattern = r'^\*?[^\n]{0,80}年度报告全文[\s\n]*'
+        cleaned = re.sub(header_pattern, '', cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r'^\d+\s*$', '', cleaned, flags=re.MULTILINE)  # 纯页码
+        cleaned = re.sub(r'^\d+\s*[/／]\s*\d+\s*$', '', cleaned, flags=re.MULTILINE)  # 1/100
+        cleaned = re.sub(r'^第\s*\d+\s*页\s*$', '', cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r'^共\s*\d+\s*页\s*$', '', cleaned, flags=re.MULTILINE)
+        
+        # 移除行首的孤立 * 标记（PDF 格式伪影）
+        cleaned = re.sub(r'^\*(?=[\u4e00-\u9fff□√一二三四五六七八九十（\-0-9])', '', cleaned, flags=re.MULTILINE)
+        
         # 移除连续的特殊字符（保留中文、英文、数字、常见标点和括号）
-        cleaned = re.sub('[^\\u4e00-\\u9fff\\u0020-\\u007e\\n\\r\\t，。！？；：""''（）【】\\[\\]]+', ' ', cleaned)
+        cleaned = re.sub('[^\\u4e00-\\u9fff\\u0020-\\u007e\\n\\r\\t，。！？；：""''（）【】\\[\\]|%-]+', ' ', cleaned)
         
         # 移除多余的空格
         cleaned = re.sub(r' +', ' ', cleaned)
@@ -500,7 +515,10 @@ class TableContextIdentifier:
                 while cells and cells[-1] == '':
                     cells = cells[:-1]
                 if cells:
-                    parsed_rows.append(cells)
+                    # 清理：移除连续的空单元格，保留有内容的单元格
+                    cleaned_cells = self._clean_empty_cells(cells)
+                    if cleaned_cells:
+                        parsed_rows.append(cleaned_cells)
             elif '\t' in line:
                 cells = [cell.strip() for cell in line.split('\t')]
                 if cells:
@@ -513,9 +531,9 @@ class TableContextIdentifier:
         if not parsed_rows:
             return table_content
         
-        # 如果已经有正确的 markdown 格式
+        # 如果已经有正确的 markdown 格式，也进行空单元格清理
         if has_separator:
-            return table_content
+            return self._clean_markdown_table(table_content)
         
         # 标准化列数
         max_cols = max(len(row) for row in parsed_rows) if parsed_rows else 0
@@ -537,6 +555,46 @@ class TableContextIdentifier:
                 result_lines.append("| " + " | ".join(row) + " |")
         
         return "\n".join(result_lines)
+    
+    def _clean_empty_cells(self, cells: List[str]) -> List[str]:
+        """清理连续的空单元格，合并相邻的空格"""
+        if not cells:
+            return cells
+        
+        cleaned = []
+        prev_empty = False
+        
+        for cell in cells:
+            is_empty = cell.strip() == ''
+            if is_empty:
+                if not prev_empty:
+                    # 第一个空单元格保留（可能是格式需要）
+                    cleaned.append('')
+                prev_empty = True
+            else:
+                cleaned.append(cell)
+                prev_empty = False
+        
+        # 如果清理后只剩空单元格，返回原始
+        if all(c == '' for c in cleaned):
+            return cells
+        
+        return cleaned
+    
+    def _clean_markdown_table(self, content: str) -> str:
+        """清理已有的 Markdown 表格，移除过多的空单元格"""
+        lines = content.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            if '|' in line:
+                # 移除连续的空单元格 |  |  |  | -> |  |
+                line = re.sub(r'(\|\s*){3,}', '| ', line)
+                # 清理行尾多余的空单元格
+                line = re.sub(r'(\|\s*)+\|$', ' |', line)
+            cleaned_lines.append(line)
+        
+        return '\n'.join(cleaned_lines)
     
     def _calculate_completeness(self, group: TableGroup) -> float:
         """计算完整性分数"""
@@ -649,11 +707,7 @@ class ChineseFinancialContextIdentifier(TableContextIdentifier):
         }
         
         # 会计科目识别
-        self.accounting_items = [
-            '资产', '负债', '所有者权益', '收入', '成本', '费用',
-            '利润', '现金', '应收', '应付', '存货', '固定资产',
-            '无形资产', '长期', '短期', '流动', '非流动'
-        ]
+        self.accounting_items = BROAD_ACCOUNTING_CATEGORIES
         
         # 时间期间模式
         self.period_patterns = [
@@ -750,6 +804,15 @@ class ChineseFinancialContextIdentifier(TableContextIdentifier):
         if len(content) > 300 or len(content) < 5:
             return False
         
+        # 末尾是句号/问号/感叹号，极大概率是句子而非表头
+        if content and content[-1] in ['。', '！', '？', '!', '?']:
+            return False
+        
+        has_separators = any(sep in content for sep in ['|', '\t', '    '])
+        # 长文本且没有列分隔符，通常是叙述性文本
+        if len(content) > 50 and not has_separators:
+            return False
+        
         # 计算表头特征得分
         score = 0
         
@@ -762,7 +825,7 @@ class ChineseFinancialContextIdentifier(TableContextIdentifier):
             score += 0.3
         
         # 包含分隔符（表明是列名）
-        if any(sep in content for sep in ['|', '\t', '    ']):  # 4个空格
+        if has_separators:  # 4个空格
             score += 0.3
         
         # 包含括号说明（如单位）
@@ -851,34 +914,75 @@ class ChineseFinancialContextIdentifier(TableContextIdentifier):
     
     def _extract_accounting_items(self, group: TableGroup) -> List[str]:
         """提取会计科目"""
-        items = []
-        
         if not group.table:
-            return items
+            return []
         
         content = group.table.content
+        candidates = set()
         
-        # 查找会计科目
+        # 基础词表命中（如 资产 / 负债 / 收入 / 利润等）
         for item in self.accounting_items:
             if item in content:
-                items.append(item)
+                candidates.add(item)
+        # 精细词表命中（完整会计科目，用于补充发现）
+        for item in STANDARD_ACCOUNTING_ITEMS:
+            if item in content:
+                candidates.add(item)
         
-        # 查找具体科目（如：应收账款、其他应付款等）
+        # 常见会计科目词表（过滤碎片时优先保留）
+        common_items = set(COMMON_ACCOUNTING_ITEMS) | set(STANDARD_ACCOUNTING_ITEMS)
+        
+        # 结构化匹配常见科目，限制长度避免截取句子
         specific_patterns = [
-            r'(应收[^，。\s]{2,6})',
-            r'(应付[^，。\s]{2,6})',
-            r'(预[收付][^，。\s]{2,6})',
-            r'(其他[^，。\s]{2,8})',
-            r'([^，。\s]{2,4}资产)',
-            r'([^，。\s]{2,4}负债)'
+            r'(交易性金融资产)',
+            r'(衍生金融资产)',
+            r'(交易性金融负债)',
+            r'(衍生金融负债)',
+            r'(其他应[收付][^，。\s]{0,6})',
+            r'(应收[^，。\s]{1,8})',
+            r'(应付[^，。\s]{1,8})',
+            r'(预[收付][^，。\s]{1,8})',
+            r'([^，。\s]{2,8}资产)',
+            r'([^，。\s]{2,8}负债)'
         ]
         
         for pattern in specific_patterns:
             matches = re.findall(pattern, content)
-            items.extend(matches)
+            candidates.update(matches)
         
-        # 去重
-        return list(set(items))
+        # 噪声关键词（出现即视为叙述性文本而非科目）
+        noise_keywords = [
+            '如果', '超过', '可能', '导致', '标准', '指标', '衡量',
+            '缺陷', '损失', '报告', '错报', '单独', '连同'
+        ]
+        # 合法前缀：支持生成型科目（如 应收/应付/预收/长期等）
+        allowed_prefixes = (
+            '应收', '应付', '预收', '预付', '其他应收', '其他应付',
+            '长期', '短期', '交易性', '衍生', '租赁', '合同', '递延',
+            '固定', '无形', '在建', '资产', '负债', '收入', '成本', '利润', '现金', '货币'
+        )
+        punctuation_pattern = re.compile(r'[，。、；：,:%（）()\-]')
+        digit_or_ascii = re.compile(r'[A-Za-z0-9]')
+        
+        filtered: List[str] = []
+        for item in candidates:
+            token = item.strip()
+            if len(token) < 2 or len(token) > 15:
+                continue
+            if punctuation_pattern.search(token):
+                continue
+            if digit_or_ascii.search(token):
+                continue
+            if any(noise in token for noise in noise_keywords):
+                continue
+            if token[-1] in {'和', '或', '的', '则', '为', '及'}:
+                continue
+            
+            # 只保留：在常见科目词表中，或有明确科目前缀
+            if token in common_items or token.startswith(allowed_prefixes):
+                filtered.append(token)
+        
+        return list(set(filtered))
     
     def _extract_time_periods(self, group: TableGroup) -> List[str]:
         """提取时间期间"""

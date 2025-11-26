@@ -219,29 +219,38 @@ class SmartChunker:
         # 获取或估算 bbox
         bbox, bbox_estimated = self._get_or_estimate_bbox(group, page_number)
         
+        # 计算表格维度（从内容推断）
+        row_count, col_count = self._estimate_table_dimensions(group)
+        
+        # 清理会计科目（移除开头标点、过滤不完整项）
+        cleaned_accounting_items = self._clean_accounting_items(group.accounting_items) if group.accounting_items else []
+        
         # 创建表格元数据
         table_meta = TableMetadata(
-            table_dimensions=f"{len(group.table.rows) if group.table and hasattr(group.table, 'rows') else 0}x{len(group.table.rows[0]) if group.table and hasattr(group.table, 'rows') and group.table.rows else 0}",
+            table_dimensions=f"{row_count}x{col_count}",
             has_header=True if group.title else False,
             table_type=group.table_type.value if group.table_type else 'other',
             high_value=group.table.quality_score > 0.9 if group.table else False,
             extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
-            row_count=len(group.table.rows) if group.table and hasattr(group.table, 'rows') else 0,
-            column_count=len(group.table.rows[0]) if group.table and hasattr(group.table, 'rows') and group.table.rows else 0,
+            row_count=row_count,
+            column_count=col_count,
             contains_financial_data=True,
-            accounting_items=group.accounting_items if group.accounting_items else [],
+            accounting_items=cleaned_accounting_items,
             time_periods=group.time_periods if group.time_periods else [],
             numeric_summary=self._calculate_numeric_summary(group),
             bbox_estimated=bbox_estimated
         )
         
+        # 清理 unified_markdown 中残留的 * 前缀
+        cleaned_content = self._clean_content_markers(group.unified_markdown)
+        
         chunk = Chunk(
-            content=group.unified_markdown,
+            content=cleaned_content,
             chunk_type=ChunkType.TABLE_GROUP,
             metadata=metadata,
             quality_score=group.calculate_group_quality(),
             contains_financial_data=True,
-            financial_indicators=group.accounting_items,
+            financial_indicators=cleaned_accounting_items,
             # 表格相关字段
             is_table=True,
             table_structure_preserved=True,
@@ -253,13 +262,118 @@ class SmartChunker:
             extraction_confidence=group.table.extraction_confidence if group.table else 0.95,
             # 添加起止位置
             start_char=0,
-            end_char=len(group.unified_markdown) if group.unified_markdown else 0
+            end_char=len(cleaned_content) if cleaned_content else 0
         )
         
         # 添加关键词
         chunk.keywords = self._extract_keywords(group.unified_content)
         
         return chunk
+    
+    def _estimate_table_dimensions(self, group: TableGroup) -> Tuple[int, int]:
+        """
+        从表格内容估算行列数
+        
+        Returns:
+            Tuple[row_count, col_count]
+        """
+        # 优先使用 rows 属性
+        if group.table and hasattr(group.table, 'rows') and group.table.rows:
+            rows = group.table.rows
+            return len(rows), len(rows[0]) if rows[0] else 0
+        
+        # 从 content 推断
+        content = group.unified_content or (group.table.content if group.table else "")
+        if not content:
+            return 0, 0
+        
+        lines = [l.strip() for l in content.split('\n') if l.strip()]
+        row_count = 0
+        col_count = 0
+        
+        for line in lines:
+            # 跳过标题行（【标题】、【说明】等）
+            if line.startswith('【') and '】' in line[:10]:
+                continue
+            # 跳过分隔线
+            if re.match(r'^[-\s|:]+$', line):
+                continue
+            
+            row_count += 1
+            
+            # 估算列数
+            if '|' in line:
+                # Markdown 格式
+                cells = [c for c in line.split('|') if c.strip()]
+                col_count = max(col_count, len(cells))
+            elif '\t' in line:
+                cells = line.split('\t')
+                col_count = max(col_count, len(cells))
+            elif re.search(r'\s{2,}', line):
+                cells = re.split(r'\s{2,}', line)
+                col_count = max(col_count, len(cells))
+        
+        return row_count, col_count
+    
+    def _clean_accounting_items(self, items: List[str]) -> List[str]:
+        """
+        清理会计科目列表
+        - 移除开头的标点符号
+        - 过滤过短或不完整的项
+        """
+        if not items:
+            return []
+        
+        cleaned = []
+        for item in items:
+            if not item:
+                continue
+            
+            # 移除开头的标点
+            item = re.sub(r'^[、,，。；：\s]+', '', item)
+            
+            # 移除结尾的标点
+            item = re.sub(r'[、,，。；：\s]+$', '', item)
+            
+            # 过滤过短的项（小于2个字符）
+            if len(item) < 2:
+                continue
+            
+            # 过滤明显不完整的项（如只有"他长期"而不是"其他长期"）
+            if item.startswith('他') and len(item) < 4:
+                continue
+            
+            cleaned.append(item)
+        
+        # 去重
+        return list(dict.fromkeys(cleaned))
+    
+    def _clean_content_markers(self, content: str) -> str:
+        """
+        清理内容中残留的标记符号
+        - 移除开头的孤立 * 前缀（保留 markdown 粗体 **）
+        - 移除页码+星号模式 (如 "9。*")
+        """
+        if not content:
+            return content
+        
+        cleaned = content
+        
+        # 移除 "数字。*" 模式（页码+星号）
+        cleaned = re.sub(r'\d+。\*\s*', '', cleaned)
+        cleaned = re.sub(r'\d+\.\*\s*', '', cleaned)
+        
+        # 移除开头的孤立 * 前缀（不移除 ** 开头的 markdown 粗体）
+        # 只有当 * 后面不是另一个 * 时才移除
+        cleaned = re.sub(r'^\*(?!\*)', '', cleaned)
+        
+        # 移除行首的孤立 * 标记（保留 markdown 粗体 **）
+        cleaned = re.sub(r'^(\*(?!\*))', '', cleaned, flags=re.MULTILINE)
+        
+        # 移除行尾孤立的 *（保留 markdown 粗体结尾 **）
+        cleaned = re.sub(r'(?<!\*)\*\s*$', '', cleaned, flags=re.MULTILINE)
+        
+        return cleaned.strip()
     
     def _get_or_estimate_bbox(
         self, 
@@ -670,8 +784,11 @@ class SmartChunker:
             confidences = [elem.extraction_confidence for elem in elements if hasattr(elem, 'extraction_confidence')]
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0.95
         
+        # 清理内容中的标记符号
+        cleaned_content = self._clean_content_markers(content)
+        
         chunk = Chunk(
-            content=content,
+            content=cleaned_content,
             chunk_type=ChunkType.TEXT_GROUP,
             metadata=metadata,
             quality_score=self._calculate_content_quality(content),
@@ -718,6 +835,19 @@ class SmartChunker:
         position = 0
         
         while start < len(content):
+            # 如果不是第一个子块，尝试在句子边界开始
+            if start > 0:
+                # 在 overlap 区域内找到下一个句子开头
+                search_end = min(start + self.overlap, len(content))
+                for punct in ['。', '！', '？', '.', '!', '?']:
+                    next_punct = content.find(punct, start, search_end)
+                    if next_punct != -1 and next_punct + 1 < len(content):
+                        start = next_punct + 1
+                        # 跳过可能的空白和换行
+                        while start < len(content) and content[start] in ' \n\t':
+                            start += 1
+                        break
+            
             end = min(start + self.child_size, len(content))
             
             # 尝试在句子边界断开
@@ -1425,6 +1555,23 @@ class ChineseFinancialChunker(SmartChunker):
             company_match = re.search(company_pattern, chunk.content)
             if company_match:
                 chunk.metadata.company_code = company_match.group(1)
+            
+            # 提取股票代码（6位数字）
+            if not chunk.metadata.company_code or not chunk.metadata.company_code.isdigit():
+                stock_code_patterns = [
+                    r'(?:股票代码|证券代码)[：:\s]*(\d{6})',  # 股票代码：300617
+                    r'[（(](\d{6})[)）]',                    # (300617) 或 （300617）
+                ]
+                for pattern in stock_code_patterns:
+                    code_match = re.search(pattern, chunk.content)
+                    if code_match:
+                        code = code_match.group(1)
+                        # 验证是有效的股票代码范围
+                        if code.startswith(('0', '3', '6', '8')):
+                            # 同时存储股票代码
+                            if not hasattr(chunk.metadata, 'stock_code'):
+                                chunk.metadata.stock_code = code
+                            break
             
             # 提取年份
             if not chunk.metadata.fiscal_year:
