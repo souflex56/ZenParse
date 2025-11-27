@@ -5,7 +5,7 @@ pdf_parsing:
   # - unstructured 使用 unstructured 的高分辨率解析（适合复杂/扫描版，但较慢）
   # - hybrid_table 启用高级表格检测与结构化（最慢，仅在特别需要表格结构时建议开启）
   strategies:
-    - pdfplumber
+    - hybrid_table
 
 context:
   context_before: 10
@@ -17,6 +17,12 @@ chunking:
   overlap: 200
   min_chunk_size: 50
   min_quality_score: 0.3
+  table:
+    include_header_hierarchy: true   # 子块内容带上科目/表头层级
+    hierarchy_max_depth: 4
+    hierarchy_max_length: 50
+    hierarchy_format: "prefix"       # prefix 或 indent
+    skip_numeric_rows: true
 
 standards_detection:
   enabled: true

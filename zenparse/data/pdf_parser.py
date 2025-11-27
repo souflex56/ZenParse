@@ -621,9 +621,12 @@ class SmartPDFParser(ChinesePDFParser):
                 self.logger.info(f"    高价值表格 {i+1}: 页{table_elem.page_number}, "
                                f"质量分数{table_elem.quality_score:.2f}")
         
+        # 基于轻量结构分析，判断 PDF 类型，便于后续跳过不必要的 OCR
+        pdf_type, _ = self._classify_pdf_type(pdf_path)
+
         # Step 2: 提取非表格文本（跳过表格区域）
-        self.logger.info("Step 2: 提取非表格文本内容...")
-        text_elements = self._extract_text_excluding_tables(pdf_path, table_elements)
+        self.logger.info(f"Step 2: 提取非表格文本内容... (pdf_type={pdf_type})")
+        text_elements = self._extract_text_excluding_tables(pdf_path, table_elements, pdf_type)
         elements_list.extend(text_elements)
         
         self.logger.info(f"  提取了 {len(text_elements)} 个文本元素")
@@ -639,27 +642,31 @@ class SmartPDFParser(ChinesePDFParser):
         
         return elements_list
     
-    def _extract_text_excluding_tables(self, pdf_path: str, table_elements: List[DocumentElement]) -> List[DocumentElement]:
-        """提取文本，排除已识别的表格区域"""
-        text_elements = []
+    def _extract_text_excluding_tables(
+        self,
+        pdf_path: str,
+        table_elements: List[DocumentElement],
+        pdf_type: Optional[str] = None,
+    ) -> List[DocumentElement]:
+        """提取文本，排除已识别的表格区域；数字版跳过 OCR，仅在扫描或无文本时再用 OCR"""
+        text_elements: List[DocumentElement] = []
+        normalized_type = (pdf_type or "unknown").lower()
+        use_ocr = normalized_type == "scanned"
         
-        # 尝试用unstructured提取文本
-        if is_engine_available('unstructured'):
+        # 仅在扫描版或完全没有文本的情况下才跑 OCR（hi_res）
+        if use_ocr and is_engine_available('unstructured'):
             try:
-                # 使用auto策略以正确处理各种PDF格式
                 partition_elements = partition_pdf(
                     filename=pdf_path,
-                    #strategy="auto",  # auto策略可以自动检测并使用OCR
-                    strategy="hi_res",  # 高分辨率策略，支持中文OCR
-                    infer_table_structure=False,  # 不推断表格，因为表格已单独处理
-                    languages=["chi_sim", "eng"],  # 支持中英文
+                    strategy="hi_res",  # 仅扫描版使用高分辨率+OCR
+                    infer_table_structure=False,
+                    languages=["chi_sim", "eng"],
                     include_page_breaks=True,
                     include_metadata=True,
-                    coordinates=True  # 获取坐标
+                    coordinates=True
                 )
                 
                 for elem in partition_elements:
-                    # 跳过表格类型
                     if hasattr(elem, 'category') and 'table' in elem.category.lower():
                         continue
                     
@@ -667,19 +674,14 @@ class SmartPDFParser(ChinesePDFParser):
                     if not content or len(content) < 10:
                         continue
                     
-                    # 获取元数据
                     metadata = self._extract_element_metadata(elem)
                     page_number = metadata.get('page_number', 1)
                     bbox = metadata.get('bbox')
                     
-                    # 检查是否与表格重叠
                     if self._overlaps_with_tables(bbox, page_number, table_elements):
                         continue
                     
-                    # 清理内容
                     content = clean_extra_whitespace(content)
-                    
-                    # 识别元素类型
                     element_type = self._identify_element_type(content, metadata)
                     
                     doc_elem = DocumentElement(
@@ -720,14 +722,12 @@ class SmartPDFParser(ChinesePDFParser):
                             continue
                         
                         # 获取表格区域以排除
-                        table_bboxes = []
-                        tables = page.extract_tables()
-                        if tables:
-                            for table in tables:
-                                # 获取表格的边界框
-                                table_settings = page.find_tables()[0] if page.find_tables() else None
-                                if table_settings and hasattr(table_settings, 'bbox'):
-                                    table_bboxes.append(table_settings.bbox)
+                        table_bboxes: List[Tuple[float, float, float, float]] = []
+                        page_tables = page.find_tables()
+                        for tbl in page_tables or []:
+                            bbox = getattr(tbl, "bbox", None)
+                            if bbox:
+                                table_bboxes.append(bbox)
                         
                         # 提取非表格文本
                         # 如果有表格，尝试排除表格区域
@@ -787,6 +787,46 @@ class SmartPDFParser(ChinesePDFParser):
                             
             except Exception as e:
                 self.logger.error(f"pdfplumber文本提取失败: {e}")
+        
+        # 如果仍然没有文本且之前未跑OCR，最后兜底一次OCR
+        if not text_elements and not use_ocr and is_engine_available('unstructured'):
+            self.logger.info("pdfplumber未提取到文本，兜底启用OCR(hi_res)")
+            try:
+                partition_elements = partition_pdf(
+                    filename=pdf_path,
+                    strategy="hi_res",
+                    infer_table_structure=False,
+                    languages=["chi_sim", "eng"],
+                    include_page_breaks=True,
+                    include_metadata=True,
+                    coordinates=True
+                )
+                for elem in partition_elements:
+                    if hasattr(elem, 'category') and 'table' in elem.category.lower():
+                        continue
+                    content = str(elem).strip()
+                    if not content or len(content) < 10:
+                        continue
+                    metadata = self._extract_element_metadata(elem)
+                    page_number = metadata.get('page_number', 1)
+                    bbox = metadata.get('bbox')
+                    if self._overlaps_with_tables(bbox, page_number, table_elements):
+                        continue
+                    content = clean_extra_whitespace(content)
+                    element_type = self._identify_element_type(content, metadata)
+                    text_elements.append(
+                        DocumentElement(
+                            element_type=element_type,
+                            content=content,
+                            page_number=page_number,
+                            bbox=bbox,
+                            quality_score=self._calculate_quality_score(content),
+                            extraction_confidence=0.8,
+                            metadata=metadata,
+                        )
+                    )
+            except Exception as e:
+                self.logger.warning(f"OCR兜底仍然失败: {e}")
         
         return text_elements
     

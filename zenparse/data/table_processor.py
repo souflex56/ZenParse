@@ -67,18 +67,9 @@ class TableElement:
     
     def to_markdown(self) -> str:
         """转换为Markdown格式"""
-        # 如果有 raw_data，使用结构化数据生成 markdown
-        if self.raw_data and len(self.raw_data) > 0:
-            return self._raw_data_to_markdown()
+        if not self.raw_data:
+            return self.content
         
-        # 否则，尝试解析 content 生成 markdown
-        if self.content:
-            return self._parse_content_to_markdown()
-        
-        return ""
-    
-    def _raw_data_to_markdown(self) -> str:
-        """将 raw_data 转换为 Markdown 格式"""
         lines = ["【表格内容】"]
         
         # 添加表头
@@ -94,71 +85,6 @@ class TableElement:
                 lines.append("| " + " | ".join(cells) + " |")
         
         return "\n".join(lines)
-    
-    def _parse_content_to_markdown(self) -> str:
-        """解析 content 内容并转换为 Markdown 格式"""
-        if not self.content:
-            return ""
-        
-        lines = self.content.split('\n')
-        parsed_rows = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # 跳过已有的 markdown 分隔线
-            if re.match(r'^[\|\s\-:]+$', line) and '---' in line:
-                continue
-            
-            # 检测是否已经是 pipe 分隔格式
-            if '|' in line:
-                cells = [cell.strip() for cell in line.split('|')]
-                # 移除首尾空元素
-                while cells and cells[0] == '':
-                    cells = cells[1:]
-                while cells and cells[-1] == '':
-                    cells = cells[:-1]
-                if cells:
-                    parsed_rows.append(cells)
-            # Tab 分隔
-            elif '\t' in line:
-                cells = [cell.strip() for cell in line.split('\t')]
-                if cells:
-                    parsed_rows.append(cells)
-            # 多空格分隔
-            elif re.search(r'\s{2,}', line):
-                cells = [cell.strip() for cell in re.split(r'\s{2,}', line)]
-                if cells:
-                    parsed_rows.append(cells)
-            else:
-                # 单行文本，作为单列处理
-                parsed_rows.append([line])
-        
-        if not parsed_rows:
-            return self.content
-        
-        # 标准化列数（以最多列数为准）
-        max_cols = max(len(row) for row in parsed_rows) if parsed_rows else 0
-        for i, row in enumerate(parsed_rows):
-            while len(row) < max_cols:
-                row.append("")
-        
-        # 生成 markdown
-        result_lines = ["【表格内容】"]
-        
-        if parsed_rows:
-            # 第一行作为表头
-            headers = parsed_rows[0]
-            result_lines.append("| " + " | ".join(headers) + " |")
-            result_lines.append("|" + "|".join([" --- " for _ in headers]) + "|")
-            
-            # 其余行作为数据
-            for row in parsed_rows[1:]:
-                result_lines.append("| " + " | ".join(row) + " |")
-        
-        return "\n".join(result_lines)
     
     def to_dataframe(self) -> Optional['pd.DataFrame']:
         """转换为pandas DataFrame"""
@@ -434,11 +360,7 @@ class HybridTableProcessor:
                         
                         # 解析表格结构
                         raw_data = self._parse_table_structure(table_content)
-                        if not raw_data:
-                            continue
-                        if not self._is_valid_single_cell_table(raw_data):
-                            continue
-                        if len(raw_data) < 2:
+                        if not raw_data or len(raw_data) < 2:
                             continue
                         
                         # 获取边界框
@@ -516,8 +438,8 @@ class HybridTableProcessor:
                         if not cleaned_data:
                             continue
                         
-                        # 获取表格边界框（返回 bbox 和是否为估算值）
-                        table_bbox, bbox_estimated = self._find_table_bbox(page, cleaned_data)
+                        # 获取表格边界框
+                        table_bbox = self._find_table_bbox(page, cleaned_data)
                         
                         # 创建表格元素
                         table_elem = TableElement(
@@ -534,8 +456,7 @@ class HybridTableProcessor:
                             metadata={
                                 'source_file': str(pdf_path),
                                 'extraction_time': time.time(),
-                                'contains_financial_data': self._contains_financial_data(cleaned_data),
-                                'bbox_estimated': bbox_estimated
+                                'contains_financial_data': self._contains_financial_data(cleaned_data)
                             }
                         )
                         
@@ -598,9 +519,6 @@ class HybridTableProcessor:
                     
                     # 尝试解析表格结构
                     raw_data = self._parse_table_structure(content)
-                    if raw_data and not self._is_valid_single_cell_table(raw_data):
-                        # 过滤误判的单单元格/单行表格
-                        continue
                     
                     table_elem = TableElement(
                         content=content,
@@ -625,37 +543,6 @@ class HybridTableProcessor:
         
         return tables
     
-    def _is_valid_single_cell_table(self, table_data: List[List]) -> bool:
-        """检查单行/单列表格是否为有效表格，过滤长句伪表格"""
-        if not table_data or not table_data[0]:
-            return False
-        
-        rows = len(table_data)
-        cols = len(table_data[0])
-        
-        # 多行多列表格直接视为有效
-        if rows > 1 and cols > 1:
-            return True
-        
-        # 聚合文本内容
-        if rows == 1 and cols == 1:
-            content = str(table_data[0][0] or "")
-        elif rows == 1:
-            content = "".join(str(c or "") for c in table_data[0])
-        elif cols == 1:
-            content = "".join(str(r[0] or "") for r in table_data)
-        else:
-            # 行>1但列数为0的异常情况，拼接全部单元格
-            content = "".join("".join(str(c or "") for c in row) for row in table_data)
-        
-        content = content.strip()
-        
-        # 长文本且包含标点，极大概率是叙述性文本
-        if len(content) > 50 and any(p in content for p in ['，', '。', '；', '!', '?', ';']):
-            return False
-        
-        return True
-
     def _clean_table_data(self, table_data: List[List]) -> List[List]:
         """清理表格数据"""
         cleaned = []
@@ -677,85 +564,38 @@ class HybridTableProcessor:
             
             cleaned.append(cleaned_row)
         
-        # 对窄表格进行有效性校验，过滤误识别的长文本
-        if cleaned and not self._is_valid_single_cell_table(cleaned):
-            return []
-        
         return cleaned
     
-    def _find_table_bbox(self, page, table_data) -> Tuple[Tuple[float, float, float, float], bool]:
-        """
-        查找表格的边界框
-        
-        Returns:
-            Tuple[bbox, is_estimated]: bbox 坐标和是否为估算值的标记
-        """
+    def _find_table_bbox(self, page, table_data) -> Optional[Tuple[float, float, float, float]]:
+        """查找表格的边界框"""
         try:
-            # 方法1：通过page.find_tables()获取精确表格位置
+            # 方法1：通过page.find_tables()获取表格位置
             page_tables = page.find_tables()
             if page_tables:
                 for table in page_tables:
-                    if hasattr(table, 'bbox') and table.bbox:
-                        self.logger.debug(f"通过 find_tables 获取精确 bbox: {table.bbox}")
-                        return (table.bbox, False)  # 精确值
+                    if hasattr(table, 'bbox'):
+                        return table.bbox
             
-            # 方法2：通过第一个单元格内容查找位置（部分估算）
+            # 方法2：通过第一个单元格内容查找位置
             if table_data and table_data[0] and table_data[0][0]:
                 first_cell = str(table_data[0][0]).strip()
-                if first_cell and len(first_cell) > 1:  # 确保有足够内容匹配
-                    try:
-                        words = page.extract_words()
-                        for word in words:
-                            if first_cell[:min(10, len(first_cell))] in word.get('text', ''):
-                                # 基于第一个单词和表格维度估算边界
-                                x0, y0 = word['x0'], word['top']
-                                # 根据表格行列数估算大小
-                                num_cols = len(table_data[0]) if table_data[0] else 1
-                                num_rows = len(table_data)
-                                # 估算每列宽度（基于页面宽度）
-                                page_content_width = page.width - 100  # 留出边距
-                                estimated_col_width = min(100, page_content_width / num_cols)
-                                estimated_row_height = 25  # 每行约25点高度
-                                estimated_width = num_cols * estimated_col_width
-                                estimated_height = num_rows * estimated_row_height
-                                # 确保不超出页面
-                                x1 = min(x0 + estimated_width, page.width - 30)
-                                y1 = min(y0 + estimated_height, page.height - 30)
-                                bbox = (x0, y0, x1, y1)
-                                self.logger.debug(f"通过单元格内容估算 bbox: {bbox}")
-                                return (bbox, True)  # 估算值
-                    except Exception as e:
-                        self.logger.debug(f"单元格定位失败: {e}")
+                if first_cell:
+                    words = page.extract_words()
+                    for word in words:
+                        if first_cell in word['text']:
+                            # 基于第一个单词估算表格边界
+                            x0, y0 = word['x0'], word['top']
+                            # 估算表格大小
+                            estimated_width = len(table_data[0]) * 100
+                            estimated_height = len(table_data) * 25
+                            return (x0, y0, x0 + estimated_width, y0 + estimated_height)
             
-            # 方法3：智能估算（基于表格维度和页面布局）
-            num_cols = len(table_data[0]) if table_data and table_data[0] else 5
-            num_rows = len(table_data) if table_data else 10
-            
-            # 估算表格在页面中的位置（居中偏上）
-            page_width = getattr(page, 'width', 595)  # A4 默认宽度
-            page_height = getattr(page, 'height', 842)  # A4 默认高度
-            
-            # 计算表格尺寸
-            table_width = min(page_width - 80, num_cols * 80)  # 每列约80点
-            table_height = min(page_height * 0.6, num_rows * 25)  # 每行约25点
-            
-            # 居中放置
-            x0 = (page_width - table_width) / 2
-            y0 = 80  # 顶部留出边距
-            x1 = x0 + table_width
-            y1 = y0 + table_height
-            
-            bbox = (x0, y0, x1, y1)
-            self.logger.debug(f"使用智能估算 bbox: {bbox} (rows={num_rows}, cols={num_cols})")
-            return (bbox, True)  # 估算值
+            # 方法3：使用页面默认区域
+            return (50, 100, page.width - 50, page.height - 100)
             
         except Exception as e:
-            self.logger.warning(f"bbox 提取失败，使用默认值: {e}")
-            # 最终兜底：使用页面大部分区域
-            page_width = getattr(page, 'width', 595)
-            page_height = getattr(page, 'height', 842)
-            default_bbox = (40, 60, page_width - 40, page_height - 60)
-            return (default_bbox, True)
+            self.logger.debug(f"无法确定表格边界框: {e}")
+            return None
     
     def _format_table_as_markdown(self, table_data: List[List]) -> str:
         """将表格格式化为Markdown"""

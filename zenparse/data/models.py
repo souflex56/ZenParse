@@ -137,6 +137,7 @@ class TableGroup(BaseModel):
     # 统一内容
     unified_content: str = ""
     unified_markdown: str = ""
+    row_header_paths: List[str] = field(default_factory=list)  # 行级层级路径（用于表头/科目层级保留）
     
     # 财报特定信息
     accounting_items: List[str] = field(default_factory=list)  # 会计科目

@@ -33,6 +33,14 @@ class SmartChunker:
         self.child_size = self.config.get('child_size', 1000)   # 子块大小
         self.overlap = self.config.get('overlap', 200)          # 重叠大小
         
+        # 表格层级表头配置
+        table_cfg = {}
+        if isinstance(self.config, dict):
+            table_cfg = self.config.get('table', {}) or self.config.get('chunking', {}).get('table', {})
+        self.include_header_hierarchy = table_cfg.get('include_header_hierarchy', True)
+        self.hierarchy_format = table_cfg.get('hierarchy_format', 'prefix')  # prefix | indent
+        self.hierarchy_max_length = table_cfg.get('hierarchy_max_length', 50)
+        
         # 质量阈值
         self.min_chunk_size = self.config.get('min_chunk_size', 50)
         self.min_quality_score = self.config.get('min_quality_score', 0.3)
@@ -440,6 +448,44 @@ class SmartChunker:
         self.logger.debug(f"估算 bbox: {bbox} (行数={line_count}, 最长行={max_line_length})")
         
         return (bbox, True)
+
+    def _format_row_with_path(self, path: str, line: str) -> str:
+        """根据配置将层级路径与行内容拼接"""
+        if not path:
+            return line
+        
+        path = path[: self.hierarchy_max_length]
+        if self.hierarchy_format == 'indent':
+            return f"{path}\n{line}"
+        # 默认前缀模式，LLM/embedding 友好
+        return f"【{path}】\n{line}"
+    
+    def _annotate_table_lines(self, group: TableGroup, lines: List[str]) -> List[str]:
+        """将行与层级路径绑定，供子块内容使用"""
+        if not self.include_header_hierarchy or not group:
+            return lines
+        
+        row_paths = self._get_row_paths(group)
+        
+        if not row_paths:
+            return lines
+        
+        annotated = []
+        for idx, line in enumerate(lines):
+            path = row_paths[idx] if idx < len(row_paths) else ""
+            annotated.append(self._format_row_with_path(path, line))
+        
+        return annotated
+    
+    def _get_row_paths(self, group: TableGroup) -> List[str]:
+        """提取表格的层级路径列表"""
+        if getattr(group, 'row_header_paths', None):
+            return group.row_header_paths
+        if getattr(group.table, 'metadata', None) and isinstance(group.table.metadata, dict):
+            paths = group.table.metadata.get('row_header_paths')
+            if paths:
+                return paths
+        return []
     
     def _create_table_child_chunks(
         self, 
@@ -452,7 +498,9 @@ class SmartChunker:
         # 对表格内容进行智能分割
         if group.table and group.table.content:
             # 尝试按行分割表格
+            row_paths = self._get_row_paths(group)
             rows = group.table.content.split('\n')
+            rows = self._annotate_table_lines(group, rows)
             
             current_chunk = []
             current_size = 0
@@ -475,7 +523,7 @@ class SmartChunker:
                     # 创建表格元数据
                     table_meta = TableMetadata(
                         table_dimensions="",  # 分割后的子块没有独立的维度
-                        has_header=False,  # 子块通常不含表头
+                        has_header=bool(row_paths),  # 若行带层级前缀，则视为带表头
                         table_type=group.table_type.value if group.table_type else 'other',
                         high_value=group.table.quality_score > 0.9 if group.table else False,
                         extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
@@ -532,7 +580,7 @@ class SmartChunker:
                 # 创建表格元数据
                 table_meta = TableMetadata(
                     table_dimensions="",  # 分割后的子块没有独立的维度
-                    has_header=False,  # 子块通常不含表头
+                    has_header=bool(row_paths),  # 若行带层级前缀，则视为带表头
                     table_type=group.table_type.value if group.table_type else 'other',
                     high_value=group.table.quality_score > 0.9 if group.table else False,
                     extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
@@ -1560,7 +1608,9 @@ class ChineseFinancialChunker(SmartChunker):
             return chunks
         
         # 按行分割
+        row_paths = self._get_row_paths(group)
         lines = content.split('\n')
+        lines = self._annotate_table_lines(group, lines)
         current_item = None
         current_lines = []
         
@@ -1585,7 +1635,7 @@ class ChineseFinancialChunker(SmartChunker):
                     # 创建表格元数据
                     table_meta = TableMetadata(
                         table_dimensions="",
-                        has_header=False,
+                        has_header=bool(row_paths),
                         table_type=group.table_type.value if group.table_type else 'financial_statement',
                         high_value=group.table.quality_score > 0.9 if group.table else True,
                         extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
@@ -1645,7 +1695,7 @@ class ChineseFinancialChunker(SmartChunker):
             # 创建表格元数据
             table_meta = TableMetadata(
                 table_dimensions="",
-                has_header=False,
+                has_header=bool(row_paths),
                 table_type=group.table_type.value if group.table_type else 'financial_statement',
                 high_value=group.table.quality_score > 0.9 if group.table else True,
                 extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
@@ -1702,9 +1752,11 @@ class ChineseFinancialChunker(SmartChunker):
         if group.table and group.table.content:
             content = group.table.content
             period_count = len(group.time_periods)
+            row_paths = self._get_row_paths(group)
             
             if period_count > 0:
                 lines = content.split('\n')
+                lines = self._annotate_table_lines(group, lines)
                 lines_per_period = max(1, len(lines) // period_count)
                 
                 for i, period in enumerate(group.time_periods):
@@ -1717,6 +1769,21 @@ class ChineseFinancialChunker(SmartChunker):
                     # 检查财务数据并提取指标
                     contains_financial, financial_indicators = self._detect_financial_content_with_indicators(chunk_content)
                     
+                    # 创建表格元数据
+                    table_meta = TableMetadata(
+                        table_dimensions="",  # 分割后的子块没有独立的维度
+                        has_header=bool(row_paths),  # 若行带层级前缀，则视为带表头
+                        table_type=group.table_type.value if group.table_type else 'other',
+                        high_value=group.table.quality_score > 0.9 if group.table else False,
+                        extraction_confidence=group.table.extraction_confidence if group.table and hasattr(group.table, 'extraction_confidence') else 0.95,
+                        row_count=len(chunk_lines),
+                        column_count=0,  # 分割后难以确定列数
+                        contains_financial_data=contains_financial,
+                        accounting_items=financial_indicators[:5] if financial_indicators else [],
+                        time_periods=[],
+                        numeric_summary={}
+                    )
+                    
                     chunk = Chunk(
                         content=chunk_content,
                         chunk_type=ChunkType.TABLE_GROUP,
@@ -1727,6 +1794,10 @@ class ChineseFinancialChunker(SmartChunker):
                         financial_indicators=financial_indicators,
                         start_char=i * 300,  # 估算位置
                         end_char=(i + 1) * 300 + len(chunk_content),
+                        # 表格相关字段
+                        is_table=True,
+                        table_structure_preserved=True,
+                        table_metadata=table_meta,
                         # 添加坐标信息
                         page_number=group.table.page_number if group.table else None,
                         bbox=group.table.bbox if group.table else None,

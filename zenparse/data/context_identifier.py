@@ -30,6 +30,15 @@ class TableContextIdentifier:
         self.context_after = self.config.get('context_after', 3)   # 向后查找3个元素
         self.max_title_distance = self.config.get('max_title_distance', 200)  # 增加标题最大字符距离
         
+        # 表头/科目层级保留开关与限制
+        table_cfg = {}
+        if isinstance(self.config, dict):
+            table_cfg = self.config.get('table', {}) or self.config.get('chunking', {}).get('table', {})
+        self.include_header_hierarchy = table_cfg.get('include_header_hierarchy', True)
+        self.hierarchy_max_depth = table_cfg.get('hierarchy_max_depth', 4)
+        self.hierarchy_max_length = table_cfg.get('hierarchy_max_length', 50)
+        self.skip_numeric_rows = table_cfg.get('skip_numeric_rows', True)
+        
         # 财报特定的标题模式（基于你的例子）
         self.financial_title_patterns = [
             r'[一二三四五六七八九十\d]+、\s*.*(?:会计数据|财务指标|主要.*表)',
@@ -121,6 +130,10 @@ class TableContextIdentifier:
             # 生成统一内容
             group.unified_content = self._unify_group_content(group)
             group.unified_markdown = self._generate_markdown(group)
+            
+            # 构建行级表头/科目层级路径
+            if self.include_header_hierarchy:
+                self._populate_row_header_paths(group)
             
             # 计算质量分数
             group.completeness_score = self._calculate_completeness(group)
@@ -335,6 +348,106 @@ class TableContextIdentifier:
             parts.append(f"【注释】{note_content}")
         
         return '\n\n'.join(parts)
+
+    # =========================
+    # 表头/科目层级处理
+    # =========================
+    def _populate_row_header_paths(self, group: TableGroup):
+        """基于 raw_data 或内容行生成行级层级路径"""
+        if not group.table:
+            return
+        
+        paths: List[str] = []
+        
+        # 优先使用 raw_data（来自 table_processor 注入的 metadata）
+        raw_data = None
+        if isinstance(getattr(group.table, 'metadata', None), dict):
+            raw_data = group.table.metadata.get('raw_data')
+        
+        if raw_data and isinstance(raw_data, list):
+            paths = self._build_row_header_paths(raw_data)
+        
+        # 回退：用内容行作为单列表格进行层级识别
+        if not paths and group.table.content:
+            lines = [line for line in group.table.content.split('\n') if line.strip()]
+            pseudo_raw = [[line] for line in lines]
+            paths = self._build_row_header_paths(pseudo_raw)
+        
+        if paths:
+            group.row_header_paths = paths
+            # 便于后续阶段直接读取
+            if isinstance(getattr(group.table, 'metadata', None), dict):
+                group.table.metadata['row_header_paths'] = paths
+    
+    def _build_row_header_paths(self, raw_data: List[List[Any]]) -> List[str]:
+        """从原始表格数据构建每行的层级路径"""
+        paths: List[str] = []
+        stack: List[Tuple[int, str]] = []
+        
+        for row in raw_data:
+            cell = ""
+            if row:
+                cell = str(row[0] or "").rstrip()
+            
+            # 处理空首列但有数据的行（合并单元格延续）
+            if not cell and row and any(str(c or "").strip() for c in row[1:]):
+                paths.append(" / ".join(name for _, name in stack) if stack else "")
+                continue
+            
+            # 跳过全空行
+            if not cell:
+                paths.append(" / ".join(name for _, name in stack) if stack else "")
+                continue
+            
+            # 跳过纯数字/百分比行
+            if self.skip_numeric_rows and re.match(r'^[\d,.\-%\s]+$', cell):
+                paths.append(" / ".join(name for _, name in stack) if stack else "")
+                continue
+            
+            level, normalized = self._detect_row_level(cell)
+            name = self._clean_row_name(normalized)
+            if not name:
+                paths.append(" / ".join(name for _, name in stack) if stack else "")
+                continue
+            
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, name))
+            
+            trimmed_path = " / ".join(name for _, name in stack[: self.hierarchy_max_depth])
+            paths.append(trimmed_path[: self.hierarchy_max_length])
+        
+        return paths
+    
+    def _detect_row_level(self, cell_text: str) -> Tuple[int, str]:
+        """检测单元格层级，返回(level, 去掉缩进/编号的文本)"""
+        text = cell_text or ""
+        # 计算缩进（包含全角空格）
+        leading = len(text) - len(text.lstrip(' \t　'))
+        level_from_indent = leading // 2
+        stripped = text.lstrip(' \t　')
+        
+        level = level_from_indent
+        
+        if re.match(r'^[一二三四五六七八九十]+、', stripped):
+            level = max(level, 1)
+        if re.match(r'^[（(][一二三四五六七八九十]+[)）]', stripped):
+            level = max(level, 2)
+        if re.match(r'^\d+[、.．]', stripped):
+            level = max(level, 3)
+        if stripped.startswith(('-', '•', '·', '└', '├', '─')):
+            level = max(level, level_from_indent + 1)
+            stripped = stripped[1:].strip()
+        
+        return level, stripped
+    
+    def _clean_row_name(self, text: str) -> str:
+        """清理行名称中的编号/符号"""
+        name = re.sub(r'^[一二三四五六七八九十]+、', '', text)
+        name = re.sub(r'^[（(][一二三四五六七八九十]+[)）]', '', name)
+        name = re.sub(r'^\d+[、.．]', '', name)
+        name = name.lstrip('-•·└├─').strip()
+        return name
     
     def _clean_table_content(self, content: str) -> str:
         """清理表格内容，去除乱码和噪声"""
