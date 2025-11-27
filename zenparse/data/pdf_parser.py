@@ -245,6 +245,8 @@ class ChinesePDFParser:
     def _identify_element_type(self, content: str, metadata: Dict = None) -> ElementType:
         """识别元素类型"""
         content_lower = content.lower()
+        # 去除行首页码/序号等干扰后再匹配标题
+        heading_candidate = re.sub(r'^\s*\d{1,4}\s*[．.、]?\s*', '', content)
         
         # 检查是否为标题
         if len(content) < 100:
@@ -254,11 +256,23 @@ class ChinesePDFParser:
                     return ElementType.TITLE
             
             # 检查章节标题
-            if re.match(r'^第[一二三四五六七八九十\d]+[章节部分]', content):
+            if re.match(r'^第[一二三四五六七八九十\d]+[章节部分]', heading_candidate):
+                return ElementType.TITLE
+
+            # 二级标题：一、xxx 或 一.xxx
+            if re.match(r'^[一二三四五六七八九十]+[、.]\s*\S+', heading_candidate):
+                return ElementType.TITLE
+
+            # 二级标题：（一）xxx 或 (一)xxx
+            if re.match(r'^[（(][一二三四五六七八九十]+[)）]\s*\S+', heading_candidate):
+                return ElementType.TITLE
+
+            # 三级标题：1、xxx / 1. xxx / 1．xxx
+            if re.match(r'^\d+[、.．]\s*\S+', heading_candidate):
                 return ElementType.TITLE
             
-            # 数字编号标题
-            if re.match(r'^\d+\.?\d*\.?\s*\S+', content):
+            # 数字编号标题（原有兜底）
+            if re.match(r'^\d+\.?\d*\.?\s*\S+', heading_candidate):
                 return ElementType.TITLE
         
         # 检查是否为表格（基于元数据或内容特征）
@@ -1182,6 +1196,7 @@ class ChineseFinancialPDFParser(SmartPDFParser):
                 continue
 
             should_merge = False
+            next_text = elem.content.strip()
 
             if (current_element.element_type == ElementType.TEXT and
                     elem.element_type == ElementType.TEXT):
@@ -1189,11 +1204,26 @@ class ChineseFinancialPDFParser(SmartPDFParser):
                 # 只合并同页或相邻页
                 if elem.page_number <= current_element.page_number + 1:
                     prev_text = current_element.content.strip()
-                    curr_text = elem.content.strip()
+                    curr_text = next_text
 
                     if prev_text and curr_text:
                         last_char = prev_text[-1]
                         first_char = curr_text[0]
+
+                        # 如果后一个元素是明显的章节/小节标题，避免合并
+                        heading_candidate = re.sub(r'^\s*\d{1,4}\s*[．.、]?\s*', '', curr_text)
+                        heading_patterns = [
+                            r'^第[一二三四五六七八九十\d]+[章节部分]',
+                            r'^[一二三四五六七八九十]+[、.]',
+                            r'^[（(][一二三四五六七八九十]+[)）]',
+                            r'^\d+[、.．]'
+                        ]
+                        if any(re.match(pat, heading_candidate) for pat in heading_patterns):
+                            should_merge = False
+                            # 跳过后续合并判定，直接认为是新的段落/标题
+                            merged_elements.append(current_element)
+                            current_element = elem
+                            continue
 
                         is_sentence_end = last_char in ['。', '！', '？', '!', '?', ':', '：', ';', '；']
 

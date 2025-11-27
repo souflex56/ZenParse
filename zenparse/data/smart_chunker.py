@@ -6,6 +6,7 @@
 
 import re
 import logging
+import copy
 from typing import List, Optional, Dict, Any, Tuple
 
 from .models import (
@@ -123,6 +124,19 @@ class SmartChunker:
         child_chunks = []
         
         for group in table_groups:
+            # 如果表格内容更像章节/正文（无明显表格结构），降级为文本处理
+            if group.table and self._looks_like_heading_text(group.table.content or ""):
+                parent_chunk = self._create_text_parent_chunk(group.table.content, [group.table])
+                parent_chunk.chunk_type = ChunkType.TEXT_GROUP
+                parent_chunk.is_table = False
+                parent_chunk.table_structure_preserved = False
+                parent_chunk.table_metadata = None
+                children = self._create_text_child_chunks(parent_chunk.content, parent_chunk.chunk_id, [group.table])
+                parent_chunk.child_ids = [c.chunk_id for c in children]
+                parent_chunks.append(parent_chunk)
+                child_chunks.extend(children)
+                continue
+
             # 创建父块（完整表格组）
             parent_chunk = self._create_table_parent_chunk(group)
             parent_chunks.append(parent_chunk)
@@ -619,13 +633,30 @@ class SmartChunker:
         current_size = 0
         current_page = None
         
+        # Level 1 章节边界模式（第X节/章/部分）
+        level1_section_pattern = re.compile(r'^第[一二三四五六七八九十\d]+[章节部分]')
+        # Level 2 章节边界模式（一、二、三、...、二十、等）
+        # 注意：支持 一、到 二十九、的范围（中文数字组合）
+        level2_section_pattern = re.compile(r'^[一二三四五六七八九十]+、')
+        
         for elem in elements:
             elem_size = len(elem.content)
             
             # 判断是否需要新组
             need_new_group = False
             
-            # 页面变化
+            # 检查元素内容开头
+            content_start = elem.content.strip()[:30] if elem.content else ""
+            
+            # 检测 Level 1 章节边界（第X节）- 最高优先级
+            if level1_section_pattern.match(content_start) and current_group:
+                need_new_group = True
+            
+            # 检测 Level 2 章节边界（一、二、...、二十、）
+            if level2_section_pattern.match(content_start) and current_group:
+                need_new_group = True
+            
+            # 页面变化（跳过超过1页）
             if current_page is not None and abs(elem.page_number - current_page) > 1:
                 need_new_group = True
             
@@ -662,10 +693,31 @@ class SmartChunker:
         current_sub = []
         current_size = 0
         
+        # Level 1 章节边界模式（第X节/章/部分）
+        level1_section_pattern = re.compile(r'^第[一二三四五六七八九十\d]+[章节部分]')
+        # Level 2 章节边界模式（一、二、三、...、二十、等）
+        level2_section_pattern = re.compile(r'^[一二三四五六七八九十]+、')
+        
         for elem in group:
             elem_size = len(elem.content)
+            need_new_sub = False
             
+            # 检测章节边界
+            content_start = elem.content.strip()[:30] if elem.content else ""
+            
+            # Level 1 边界
+            if level1_section_pattern.match(content_start) and current_sub:
+                need_new_sub = True
+            
+            # Level 2 边界
+            if level2_section_pattern.match(content_start) and current_sub:
+                need_new_sub = True
+            
+            # 大小超限
             if current_size + elem_size > max_size and current_sub:
+                need_new_sub = True
+            
+            if need_new_sub:
                 sub_groups.append(current_sub)
                 current_sub = [elem]
                 current_size = elem_size
@@ -960,6 +1012,11 @@ class SmartChunker:
         filtered = []
         
         for chunk in chunks:
+            # SECTION 块仅作为结构节点，跳过长度/质量过滤
+            if chunk.chunk_type == ChunkType.SECTION:
+                filtered.append(chunk)
+                continue
+
             # 质量分数检查
             if chunk.quality_score < self.min_quality_score:
                 self.logger.debug(f"过滤低质量分块: {chunk.chunk_id}, "
@@ -991,6 +1048,176 @@ class SmartChunker:
             
             # 计算连贯性分数
             chunk.metadata.coherence_score = chunk.calculate_coherence_score()
+
+    def _build_section_hierarchy(
+        self,
+        parent_chunks: List[Chunk]
+    ) -> Tuple[List[Chunk], List[Chunk]]:
+        """
+        根据标题创建 SECTION 结构节点，并将父块挂载到最近的章节节点。
+        返回 (section_chunks, updated_parent_chunks)
+        """
+        if not parent_chunks:
+            return [], parent_chunks
+
+        parents_sorted = sorted(parent_chunks, key=lambda c: c.start_char or 0)
+        section_stack: Dict[int, Chunk] = {}
+        section_chunks: List[Chunk] = []
+
+        for chunk in parents_sorted:
+            heading_level, heading_title = self._detect_heading_level(chunk.content or "")
+
+            if heading_level:
+                # 移除同级或更深层级的 section
+                for lvl in list(section_stack.keys()):
+                    if lvl >= heading_level:
+                        section_stack.pop(lvl, None)
+
+                parent_section = None
+                higher_levels = sorted([lvl for lvl in section_stack.keys() if lvl < heading_level], reverse=True)
+                if higher_levels:
+                    parent_section = section_stack[higher_levels[0]]
+
+                section_chunk = self._create_section_chunk(
+                    source_chunk=chunk,
+                    level=heading_level,
+                    title=heading_title
+                )
+
+                if parent_section:
+                    section_chunk.parent_id = parent_section.chunk_id
+                    parent_section.child_ids.append(section_chunk.chunk_id)
+
+                section_stack[heading_level] = section_chunk
+                section_chunks.append(section_chunk)
+
+                # 将当前父块挂到该 SECTION 下
+                chunk.parent_id = section_chunk.chunk_id
+                section_chunk.child_ids.append(chunk.chunk_id)
+
+                # 更新父块的章节元数据
+                chunk.metadata.section_level = heading_level
+                chunk.metadata.section_title = heading_title
+                chunk.metadata.section_path = self._compose_section_path(section_stack)
+                chunk.metadata.is_complete_section = len(chunk.content or "") <= self.parent_size
+            else:
+                # 非标题父块，挂到最近的章节（如有）
+                if section_stack:
+                    nearest_level = max(section_stack.keys())
+                    parent_section = section_stack[nearest_level]
+                    chunk.parent_id = parent_section.chunk_id
+                    parent_section.child_ids.append(chunk.chunk_id)
+                    chunk.metadata.section_level = parent_section.metadata.section_level
+                    chunk.metadata.section_title = parent_section.metadata.section_title
+                    chunk.metadata.section_path = self._compose_section_path(section_stack)
+
+        return section_chunks, parents_sorted
+
+    def _detect_heading_level(self, text: str) -> Tuple[Optional[int], str]:
+        """识别标题层级和标题文本"""
+        if not text:
+            return None, ""
+
+        first_line = text.strip().split('\n', 1)[0].strip()
+
+        # 层级1：第×节/章/部分
+        m = re.match(r'^(第[一二三四五六七八九十\d]+[章节部分])\s*(.*)', first_line)
+        if m:
+            title = f"{m.group(1)} {m.group(2)}".strip() if m.group(2) else m.group(1)
+            return 1, title
+
+        # 层级2：一、xxx 或 一.xxx
+        m = re.match(r'^([一二三四五六七八九十]+[、.])\s*(.*)', first_line)
+        if m:
+            title = f"{m.group(1)} {m.group(2)}".strip()
+            return 2, title
+
+        # 层级3：（一）xxx 或 (一)xxx
+        m = re.match(r'^([（(][一二三四五六七八九十]+[)）])\s*(.*)', first_line)
+        if m:
+            title = f"{m.group(1)} {m.group(2)}".strip()
+            return 3, title
+
+        # 层级4：1、xxx / 1. xxx / 1．xxx
+        # 需要额外验证：排除明显是正文的情况
+        m = re.match(r'^(\d+[、.．])\s*(.*)', first_line)
+        if m:
+            candidate_title = m.group(2).strip()
+            # 排除条件：
+            # 1. 标题部分太长（超过50字符，真正的标题通常较短）
+            # 2. 以年份开头（如 "2019年"，通常是正文）
+            # 3. 包含句子结尾标点（如句号，表示是完整句子而非标题）
+            # 4. 包含逗号后跟长内容（通常是正文描述）
+            is_likely_title = (
+                len(candidate_title) <= 50 and
+                not re.match(r'^\d{4}年', candidate_title) and
+                not re.search(r'[。！？]$', candidate_title) and
+                not (re.search(r'，', candidate_title) and len(candidate_title) > 30)
+            )
+            if is_likely_title:
+                title = f"{m.group(1)} {m.group(2)}".strip()
+                return 4, title
+
+        return None, ""
+
+    def _create_section_chunk(
+        self,
+        source_chunk: Chunk,
+        level: int,
+        title: str
+    ) -> Chunk:
+        """根据父块创建一个 SECTION 节点"""
+        section_metadata = copy.deepcopy(source_chunk.metadata)
+        section_metadata.section_level = level
+        section_metadata.section_title = title
+        section_metadata.section_path = []
+        section_metadata.is_complete_section = True
+
+        section_chunk = Chunk(
+            content=title or (source_chunk.content[:100] if source_chunk.content else ""),
+            chunk_type=ChunkType.SECTION,
+            start_char=source_chunk.start_char,
+            end_char=source_chunk.end_char,
+            page_number=source_chunk.page_number,
+            bbox=source_chunk.bbox,
+            element_type=source_chunk.element_type,
+            extraction_confidence=source_chunk.extraction_confidence,
+            metadata=section_metadata,
+            quality_score=1.0,
+            contains_financial_data=source_chunk.contains_financial_data,
+            financial_indicators=source_chunk.financial_indicators
+        )
+        return section_chunk
+
+    def _compose_section_path(self, section_stack: Dict[int, Chunk]) -> List[str]:
+        """根据当前 section 栈生成 section_path"""
+        if not section_stack:
+            return []
+        ordered = [section_stack[lvl] for lvl in sorted(section_stack.keys())]
+        path = []
+        for sec in ordered:
+            title = sec.metadata.section_title or (sec.content[:50] if sec.content else "")
+            if title:
+                path.append(title.strip())
+        return path
+
+    def _looks_like_heading_text(self, content: str) -> bool:
+        """
+        判断表格内容是否更像章节/正文而非表格，若是则应降级为文本处理。
+        当前用于避免“第X节...”之类的章节被误判为表格。
+        """
+        if not content:
+            return False
+
+        first_line = content.strip().split('\n', 1)[0].strip()
+        heading_candidate = re.sub(r'^\s*\d{1,4}\s*[．.、]?\s*', '', first_line)
+
+        # 明显章节标题且没有表格分隔符，视为正文
+        if re.match(r'^第[一二三四五六七八九十\d]+[章节部分]', heading_candidate):
+            if '\t' not in content and '|' not in content:
+                return True
+
+        return False
         
         self.logger.debug(f"计算了 {len(all_chunks)} 个分块的质量指标")
     
@@ -1224,6 +1451,13 @@ class ChineseFinancialChunker(SmartChunker):
         
         # 5. 添加财报特定元数据
         self._enrich_financial_metadata(parent_chunks, child_chunks)
+
+        # 6. 构建章节层级（SECTION 节点作为结构父块）
+        section_chunks, parent_chunks = self._build_section_hierarchy(parent_chunks)
+        parent_chunks.extend(section_chunks)
+        
+        # 7. 将章节元数据从父块传播到子块
+        self._propagate_section_metadata_to_children(parent_chunks, child_chunks)
         
         return parent_chunks, child_chunks
     
@@ -1534,12 +1768,61 @@ class ChineseFinancialChunker(SmartChunker):
         # 使用语义分块
         parent_chunks, child_chunks = self._semantic_chunking(text_elements)
         
-        # 添加章节信息
+        # 添加章节信息到 topics，但不覆盖 report_type
+        # report_type 应该是"年度报告/季度报告"等，不是章节名称
         for chunk in parent_chunks + child_chunks:
-            chunk.metadata.report_type = section_name
-            chunk.topics.append(section_name)
+            # 将章节名称添加到 topics 而不是 report_type
+            if section_name not in chunk.topics:
+                chunk.topics.append(section_name)
         
         return parent_chunks, child_chunks
+    
+    def _extract_metadata_from_filename(self, source_file: str) -> Dict[str, Any]:
+        """从文件名提取元数据
+        
+        支持的文件名格式：
+        - 2020-01-21__江苏安靠智能输电工程科技股份有限公司__300617__安靠智电__2019年__年度报告.pdf
+        - 公司名称__股票代码__简称__年份__报告类型.pdf
+        """
+        import os
+        metadata = {}
+        
+        if not source_file:
+            return metadata
+        
+        filename = os.path.basename(source_file)
+        # 移除扩展名
+        filename_no_ext = os.path.splitext(filename)[0]
+        
+        # 尝试按 __ 分割解析标准格式
+        parts = filename_no_ext.split('__')
+        if len(parts) >= 5:
+            # 格式: 日期__公司名称__股票代码__简称__年份__报告类型
+            # 或: 公司名称__股票代码__简称__年份__报告类型
+            for i, part in enumerate(parts):
+                # 查找公司名称（包含"公司"的部分）
+                if '公司' in part and 'company_name' not in metadata:
+                    metadata['company_name'] = part
+                
+                # 查找股票代码（6位数字）
+                if re.match(r'^\d{6}$', part) and 'company_code' not in metadata:
+                    metadata['company_code'] = part
+                
+                # 查找财务年度（YYYY年格式）
+                year_match = re.match(r'^(\d{4})年$', part)
+                if year_match and 'fiscal_year' not in metadata:
+                    metadata['fiscal_year'] = int(year_match.group(1))
+                
+                # 查找报告类型
+                if any(rt in part for rt in ['年度报告', '年报', '季度报告', '季报', '半年度报告', '半年报']):
+                    if '年度' in part or '年报' in part:
+                        metadata['report_type'] = '年度报告'
+                    elif '半年' in part:
+                        metadata['report_type'] = '半年度报告'
+                    elif '季度' in part or '季报' in part:
+                        metadata['report_type'] = '季度报告'
+        
+        return metadata
     
     def _enrich_financial_metadata(
         self,
@@ -1549,15 +1832,25 @@ class ChineseFinancialChunker(SmartChunker):
         """增强财报元数据"""
         all_chunks = parent_chunks + child_chunks
         
+        # 首先从文件名提取可靠的元数据
+        filename_metadata = self._extract_metadata_from_filename(getattr(self, 'source_file', ''))
+        
         for chunk in all_chunks:
-            # 提取公司名称 - 扩展支持更多公司类型，支持括号内容和特殊格式
-            company_pattern = r'([\u4e00-\u9fff]+(?:股份|集团|控股|科技|技术|金融|银行|证券|保险|地产|能源|医药|电子|通信|汽车|钢铁|化工|实业|投资|建设|贸易|物流|文化|教育|农业|航空|铁路|发展|企业)(?:（[^）]*）)?(?:有限|有限责任)?(?:股份)?(?:公司|企业))'
-            company_match = re.search(company_pattern, chunk.content)
-            if company_match:
-                chunk.metadata.company_code = company_match.group(1)
+            # 1. 公司名称：优先使用文件名中的公司名称
+            if filename_metadata.get('company_name'):
+                chunk.metadata.company_name = filename_metadata['company_name']
+            elif not chunk.metadata.company_name:
+                # 仅当文件名没有时，才从内容提取（作为后备方案）
+                company_pattern = r'([\u4e00-\u9fff]+(?:股份|集团|控股|科技|技术|金融|银行|证券|保险|地产|能源|医药|电子|通信|汽车|钢铁|化工|实业|投资|建设|贸易|物流|文化|教育|农业|航空|铁路|发展|企业)(?:（[^）]*）)?(?:有限|有限责任)?(?:股份)?(?:公司|企业))'
+                company_match = re.search(company_pattern, chunk.content)
+                if company_match:
+                    chunk.metadata.company_name = company_match.group(1)
             
-            # 提取股票代码（6位数字）
-            if not chunk.metadata.company_code or not chunk.metadata.company_code.isdigit():
+            # 2. 股票代码：优先使用文件名中的代码
+            if filename_metadata.get('company_code'):
+                chunk.metadata.company_code = filename_metadata['company_code']
+            elif not chunk.metadata.company_code or not chunk.metadata.company_code.isdigit():
+                # 仅当文件名没有时，才从内容提取
                 stock_code_patterns = [
                     r'(?:股票代码|证券代码)[：:\s]*(\d{6})',  # 股票代码：300617
                     r'[（(](\d{6})[)）]',                    # (300617) 或 （300617）
@@ -1568,19 +1861,67 @@ class ChineseFinancialChunker(SmartChunker):
                         code = code_match.group(1)
                         # 验证是有效的股票代码范围
                         if code.startswith(('0', '3', '6', '8')):
-                            # 同时存储股票代码
-                            if not hasattr(chunk.metadata, 'stock_code'):
-                                chunk.metadata.stock_code = code
+                            chunk.metadata.company_code = code
                             break
             
-            # 提取年份
-            if not chunk.metadata.fiscal_year:
-                year_match = re.search(r'(\d{4})年', chunk.content)
-                if year_match:
-                    chunk.metadata.fiscal_year = int(year_match.group(1))
+            # 3. 财务年度：优先使用文件名中的年份
+            if filename_metadata.get('fiscal_year'):
+                chunk.metadata.fiscal_year = filename_metadata['fiscal_year']
+            elif not chunk.metadata.fiscal_year:
+                # 仅当文件名没有时，才从内容提取
+                # 改进：优先匹配"XXXX年度报告"或"XXXX年年度"格式
+                year_report_match = re.search(r'(\d{4})\s*年[度]?\s*(?:年度)?报告', chunk.content)
+                if year_report_match:
+                    chunk.metadata.fiscal_year = int(year_report_match.group(1))
+                else:
+                    # 后备：匹配任意年份（但可能不准确）
+                    year_match = re.search(r'(\d{4})年', chunk.content)
+                    if year_match:
+                        chunk.metadata.fiscal_year = int(year_match.group(1))
+            
+            # 4. 报告类型：优先使用文件名中的类型，避免使用章节名称（如资产负债表）
+            if filename_metadata.get('report_type'):
+                # 仅当当前 report_type 为空或是章节名称时才覆盖
+                current_report_type = chunk.metadata.report_type
+                section_names = ['资产负债表', '利润表', '现金流量表', '股东权益变动表', '财务报表附注', '其他']
+                if not current_report_type or current_report_type in section_names:
+                    chunk.metadata.report_type = filename_metadata['report_type']
             
             # 计算信息密度
             chunk.metadata.information_density = chunk.calculate_information_density()
             
             # 计算连贯性分数
             chunk.metadata.coherence_score = chunk.calculate_coherence_score()
+    
+    def _propagate_section_metadata_to_children(
+        self,
+        parent_chunks: List[Chunk],
+        child_chunks: List[Chunk]
+    ):
+        """将章节元数据从父块传播到子块
+        
+        子块继承其父块的 section_level, section_path, section_title
+        """
+        if not child_chunks:
+            return
+        
+        # 构建父块ID到父块的映射
+        parent_map = {p.chunk_id: p for p in parent_chunks}
+        
+        for child in child_chunks:
+            if not child.parent_id:
+                continue
+            
+            parent = parent_map.get(child.parent_id)
+            if not parent:
+                continue
+            
+            # 如果子块没有章节信息，从父块继承
+            if child.metadata.section_level == 0 and parent.metadata.section_level > 0:
+                child.metadata.section_level = parent.metadata.section_level
+            
+            if not child.metadata.section_path and parent.metadata.section_path:
+                child.metadata.section_path = parent.metadata.section_path.copy()
+            
+            if not child.metadata.section_title and parent.metadata.section_title:
+                child.metadata.section_title = parent.metadata.section_title

@@ -197,7 +197,14 @@ class ChunkMetadata(BaseModel):
     fiscal_year: Optional[int] = None      # 财年
     fiscal_quarter: Optional[int] = None   # 季度
     company_code: Optional[str] = None     # 公司代码
+    company_name: Optional[str] = None     # 公司名称
     industry: Optional[str] = None         # 行业
+
+    # 结构化章节元数据
+    section_level: int = 0                 # 章节层级（1=节/章，2=一、，3=（一），4=1.）
+    section_path: List[str] = field(default_factory=list)  # 章节路径
+    section_title: str = ""                # 当前章节标题
+    is_complete_section: bool = False      # 是否为完整章节（未被截断）
     
     # 分块统计
     char_count: int = 0
