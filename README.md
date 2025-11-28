@@ -20,6 +20,13 @@ ZenParse 是一个专门面向 **中文上市公司财报 PDF** 的预处理工�
   - 自动识别表格的 **标题、单位说明、注释**
   - 把「标题 + 表格主体 + 注释」组合成一个 `TableGroup`
   - 尝试将表格内容转为 **标准 Markdown 表格**，保留结构，便于前端展示或检索
+  
+- **混合表格处理与高级检测（可选）**
+  - 默认使用 `pdfplumber` 快速提取表格
+  - 在 `hybrid_table` 策略下，对"低质量表格/缺表页面"按需触发 DocLayout-YOLO 或 Detectron2 做高级表格检测
+  - 自动合并 pdfplumber 与高级模型的结果，保留质量更高的表格
+  - 支持从 HuggingFace 自动下载模型，首次运行自动完成配置。
+  - 详细配置说明和选型建议请参考 [`docs/strategy_and_models.md`](docs/strategy_and_models.md)。
 
 - **父子分块架构（SmartChunker）**
   - **父块（ParentChunk）**：尽量包含完整语境的一大段（保持上下文完整）
@@ -196,6 +203,31 @@ chunking:
   - 一般来说：父块偏大、子块偏小且有适当重叠，是比较稳妥的配置
 - `min_chunk_size` / `min_quality_score`
   - 过滤过短或质量过低的分块，减少噪声
+
+### 表格抽取与高级模型配置（`table_extraction`）
+
+```yaml
+table_extraction:
+  advanced_model: doclayout_yolo       # doclayout_yolo / detectron2 / none
+  model_path: null                     # 自定义权重路径，null 表示从 HuggingFace 自动下载
+  model_repo: "juliozhao/DocLayout-YOLO-DocStructBench"  # HuggingFace 模型仓库
+  model_filename: "doclayout_yolo_docstructbench_imgsz1024.pt"  # 模型文件名
+  quality_threshold: 0.65              # 表格质量低于此值触发高级检测
+  detection_conf: 0.30                 # YOLO 置信度阈值
+  detection_iou: 0.50                  # YOLO NMS IoU 阈值
+  merge_iou_threshold: 0.55            # 表格去重合并 IoU 阈值
+  bbox_padding_ratio: 0.02             # YOLO 框裁剪前的扩张比例
+  render_dpi: 150                      # 检测用页面渲染 DPI
+  skip_ocr_for_digital: true           # 数字 PDF 下跳过 OCR 兜底
+  ocr_trigger_char_threshold: 10       # bbox 内字符数低于此值时认为"文本过少"
+```
+
+**建议**：
+- **大部分数字财报**：`advanced_model: doclayout_yolo` + 合理设置 `quality_threshold`，`model_path: null` 自动下载模型。
+- **若只追求速度**：`advanced_model: none`，只用 pdfplumber。
+- **若有扫描版/难页**，可将 `skip_ocr_for_digital` 设为 `false`，允许文本阶段触发 OCR 兜底。
+
+详细配置说明和选型建议请参考 [`docs/strategy_and_models.md`](docs/strategy_and_models.md)。
 
 ---
 
