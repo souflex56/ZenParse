@@ -17,6 +17,36 @@ from .data.smart_chunker import ChineseFinancialChunker
 from .data.models import ParentChunk, ChildChunk, TableGroup
 from .data.standards_detector import StandardsDetector
 
+# 页码/页眉页脚清洗正则
+PAGE_MARKER_RE = re.compile(
+    r"""
+    ^(?:第?\s*\d+\s*页(?:\s*/\s*共?\s*\d+\s*页)?   # 第 3 页 / 共 10 页
+    |page\s*\d+(?:\s*of\s*\d+)?                  # page 3 of 10
+    |\d+\s*/\s*\d+                               # 1/10
+    |-?\s*\d+\s*-?                               # - 3 - 或孤立页码
+    |[ivxlcdm]+\s*/\s*[ivxlcdm]+)                # 罗马页码  i/x
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+NUMERIC_LINE_RE = re.compile(r"^[\d\s/.-]{1,15}$")
+
+
+def _strip_page_markers(text: str) -> str:
+    """移除文本中的页码、页眉页脚等整行干扰信息"""
+    if not text:
+        return text
+
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        # 仅对短行的页码样式做过滤，避免误删正文数字（如 211/985）
+        if len(stripped) <= 15 and (PAGE_MARKER_RE.match(stripped) or NUMERIC_LINE_RE.match(stripped)):
+            continue
+        kept.append(line)
+
+    return "\n".join(kept)
+
 
 class ZenPipeline:
     """整合解析、上下文识别与分块的端到端管线"""
@@ -88,20 +118,34 @@ class ZenPipeline:
                 return None
         return None
 
-    def process(self, pdf_path: str) -> Tuple[List[ParentChunk], List[ChildChunk], List[TableGroup]]:
+    def process(self, pdf_path: str, source_ref: str = None) -> Tuple[List[ParentChunk], List[ChildChunk], List[TableGroup]]:
         """处理单个 PDF，返回父子分块与表格组"""
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"文件不存在: {pdf_path}")
 
         self.logger.info(f"Step 1: 解析 PDF - {pdf_path}")
+        # 传递 source_ref 给 parser (如果 parser 需要记录 source_ref 到 Element)
+        # 目前 Element 还没有 source_ref，暂时只传 pdf_path
         elements = self.parser.parse(pdf_path)
+
+        # 清洗页码/页眉页脚，避免干扰 chunk content（保留 metadata.page_numbers）
+        self.logger.info("Step 1.5: 清洗页码与页眉页脚")
+        for elem in elements:
+            content = getattr(elem, "content", "")
+            if content:
+                elem.content = _strip_page_markers(content)
 
         self.logger.info("Step 2: 识别上下文与表格组")
         table_groups = self.context_identifier.identify_table_groups(elements)
 
         self.logger.info("Step 3: 智能分块")
+        # 从文件名提取 display_name
+        display_name = os.path.basename(pdf_path)
         parent_chunks, child_chunks = self.chunker.create_chunks(
-            elements=elements, table_groups=table_groups, source_file=pdf_path
+            elements=elements, 
+            table_groups=table_groups, 
+            source_ref=source_ref,
+            display_name=display_name
         )
 
         # 准则判定（不改变返回结构，将结果保存在实例属性中）

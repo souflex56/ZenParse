@@ -73,11 +73,13 @@ class SmartChunker:
         self,
         elements: List[DocumentElement],
         table_groups: List[TableGroup],
-        source_file: str = ""
+        source_ref: Optional[str] = None,
+        display_name: Optional[str] = None
     ) -> Tuple[List[Chunk], List[Chunk]]:
         """创建父子分块"""
-        # 保存源文件路径
-        self.source_file = source_file
+        # 保存源文件引用ID和显示名称（用于元数据提取）
+        self.source_ref = source_ref
+        self.display_name = display_name
         parent_chunks = []
         child_chunks = []
         
@@ -176,7 +178,7 @@ class SmartChunker:
                 
                 # 创建带有extraction_method的元数据
                 chunk_metadata = ChunkMetadata(
-                    source_file=getattr(self, 'source_file', ''),
+                    source_ref=getattr(self, 'source_ref', None),
                     page_numbers=[group.table.page_number] if group.table and group.table.page_number else [],
                     extraction_method=group.table.extraction_method if group.table and hasattr(group.table, 'extraction_method') else 'table_group'
                 )
@@ -216,7 +218,7 @@ class SmartChunker:
             page_numbers=[page_number] if page_number is not None else [],
             extraction_method=group.table.extraction_method if group.table and hasattr(group.table, 'extraction_method') else 'table_group',
             report_type='financial_report',
-            source_file=getattr(self, 'source_file', '')
+            source_ref=getattr(self, 'source_ref', None)
         )
         
         # 添加财报特定信息
@@ -517,7 +519,7 @@ class SmartChunker:
                     child_metadata = ChunkMetadata(
                         extraction_method='table_split',
                         page_numbers=[group.table.page_number] if group.table and group.table.page_number else [],
-                        source_file=getattr(self, 'source_file', '')
+                        source_ref=getattr(self, 'source_ref', None)
                     )
                     
                     # 创建表格元数据
@@ -847,11 +849,15 @@ class SmartChunker:
         # 提取页面信息
         page_numbers = list(set(elem.page_number for elem in elements))
         
-        # 构建元数据
+        # 使用第一个元素的页码作为主页码
+        page_number = elements[0].page_number if elements else None
+        
+        # 创建元数据
         metadata = ChunkMetadata(
-            page_numbers=sorted(page_numbers),
-            extraction_method='text_semantic',
-            source_file=getattr(self, 'source_file', '')
+            page_numbers=[page_number] if page_number is not None else [],
+            extraction_method='semantic_group',
+            report_type='financial_report',
+            source_ref=getattr(self, 'source_ref', None)
         )
         
         # 检查是否包含财务信息并提取指标
@@ -983,7 +989,7 @@ class SmartChunker:
                 child_metadata = ChunkMetadata(
                     extraction_method='text_semantic',
                     page_numbers=[page_number] if page_number else [],
-                    source_file=getattr(self, 'source_file', '')
+                    source_ref=getattr(self, 'source_ref', None)
                 )
                 
                 child = Chunk(
@@ -1449,11 +1455,13 @@ class ChineseFinancialChunker(SmartChunker):
         self,
         elements: List[DocumentElement],
         table_groups: List[TableGroup],
-        source_file: str = ""
+        source_ref: Optional[str] = None,
+        display_name: Optional[str] = None
     ) -> Tuple[List[Chunk], List[Chunk]]:
         """创建财报分块（重写）"""
-        # 保存源文件路径
-        self.source_file = source_file
+        # 保存源文件引用ID和显示名称（用于元数据提取）
+        self.source_ref = source_ref
+        self.display_name = display_name
         # 预处理：按报告章节分组
         section_groups = self._group_by_report_section(elements)
         
@@ -1651,7 +1659,7 @@ class ChineseFinancialChunker(SmartChunker):
                     chunk_metadata = ChunkMetadata(
                         extraction_method='table_split',
                         page_numbers=[group.table.page_number] if group.table and group.table.page_number else [],
-                        source_file=getattr(self, 'source_file', '')
+                        source_ref=getattr(self, 'source_ref', None)
                     )
                     
                     chunk = Chunk(
@@ -1711,7 +1719,7 @@ class ChineseFinancialChunker(SmartChunker):
             chunk_metadata = ChunkMetadata(
                 extraction_method='table_split',
                 page_numbers=[group.table.page_number] if group.table and group.table.page_number else [],
-                source_file=getattr(self, 'source_file', '')
+                source_ref=getattr(self, 'source_ref', None)
             )
             
             chunk = Chunk(
@@ -1848,22 +1856,24 @@ class ChineseFinancialChunker(SmartChunker):
         
         return parent_chunks, child_chunks
     
-    def _extract_metadata_from_filename(self, source_file: str) -> Dict[str, Any]:
+    def _extract_metadata_from_filename(self, display_name: str) -> Dict[str, Any]:
         """从文件名提取元数据
         
         支持的文件名格式：
         - 2020-01-21__江苏安靠智能输电工程科技股份有限公司__300617__安靠智电__2019年__年度报告.pdf
         - 公司名称__股票代码__简称__年份__报告类型.pdf
+        
+        Args:
+            display_name: 文件名（从 sources catalog 的 display_name 获取）
         """
         import os
         metadata = {}
         
-        if not source_file:
+        if not display_name:
             return metadata
         
-        filename = os.path.basename(source_file)
         # 移除扩展名
-        filename_no_ext = os.path.splitext(filename)[0]
+        filename_no_ext = os.path.splitext(display_name)[0]
         
         # 尝试按 __ 分割解析标准格式
         parts = filename_no_ext.split('__')
@@ -1904,7 +1914,7 @@ class ChineseFinancialChunker(SmartChunker):
         all_chunks = parent_chunks + child_chunks
         
         # 首先从文件名提取可靠的元数据
-        filename_metadata = self._extract_metadata_from_filename(getattr(self, 'source_file', ''))
+        filename_metadata = self._extract_metadata_from_filename(getattr(self, 'display_name', ''))
         
         for chunk in all_chunks:
             # 1. 公司名称：优先使用文件名中的公司名称

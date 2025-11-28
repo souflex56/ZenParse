@@ -188,7 +188,7 @@ class TableMetadata(BaseModel):
 @dataclass
 class ChunkMetadata(BaseModel):
     """分块元数据"""
-    source_file: str = ""
+    source_ref: Optional[str] = None  # 源文件引用ID，通过 sources catalog 查找文件信息
     page_numbers: List[int] = field(default_factory=list)
     extraction_method: str = ""  # pdfplumber, unstructured, text_semantic等
     processing_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -555,6 +555,9 @@ class ChunkingResult(BaseModel):
     # 文档信息
     source_file: str = ""
     processing_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    # 来源目录 (Source Catalog)
+    sources: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
     # 错误和警告
     errors: List[str] = field(default_factory=list)

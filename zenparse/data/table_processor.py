@@ -404,7 +404,7 @@ class HybridTableProcessor:
                 self.logger.warning(f"表格质量阈值配置无效 ({joined}={value})，尝试下一个候选值")
         return 0.65
     
-    def extract_tables(self, pdf_path: str) -> List[TableElement]:
+    def extract_tables(self, pdf_path: str, source_ref: Optional[str] = None) -> List[TableElement]:
         """从PDF中提取所有表格（质量分级：先pdfplumber，高质量则直接用，低质再补模型）"""
         if not Path(pdf_path).exists():
             raise FileNotFoundError(f"文件不存在: {pdf_path}")
@@ -419,7 +419,7 @@ class HybridTableProcessor:
         # 首先用 pdfplumber 覆盖全页（数字版最快）
         if is_engine_available('pdfplumber'):
             self.logger.info("使用pdfplumber提取表格（首选路径）")
-            plumber_tables = self._extract_with_pdfplumber(pdf_path)
+            plumber_tables = self._extract_with_pdfplumber(pdf_path, source_ref)
             tables.extend(plumber_tables)
             
             if plumber_tables:
@@ -442,21 +442,21 @@ class HybridTableProcessor:
             model_choice = (self.advanced_model or "").lower()
             if model_choice == "doclayout_yolo" and self.table_detection_model:
                 self.logger.info("使用 DocLayout-YOLO 对低质量/缺失页面补充检测")
-                advanced_tables = self._extract_with_doclayout_yolo(pdf_path)
+                advanced_tables = self._extract_with_doclayout_yolo(pdf_path, source_ref)
                 tables = self._merge_tables(plumber_tables, advanced_tables)
             elif self.table_detection_model:
                 self.logger.info("使用高级模型对低质量/缺失页面补充检测")
-                advanced_tables = self._extract_with_advanced_model(pdf_path)
+                advanced_tables = self._extract_with_advanced_model(pdf_path, source_ref)
                 tables = self._merge_tables(plumber_tables, advanced_tables)
             elif is_engine_available('unstructured'):
                 self.logger.info("表格低质量，使用unstructured补充检测")
-                extra_tables = self._extract_with_unstructured(pdf_path)
+                extra_tables = self._extract_with_unstructured(pdf_path, source_ref)
                 tables = self._merge_tables(plumber_tables, extra_tables)
         
         # 最后兜底：仍然没有表格时尝试 unstructured
         if not tables and is_engine_available('unstructured'):
             self.logger.info("尝试使用unstructured提取表格（兜底）")
-            tables.extend(self._extract_with_unstructured(pdf_path))
+            tables.extend(self._extract_with_unstructured(pdf_path, source_ref))
         
         # 后处理：增强表格质量
         tables = self._enhance_tables(tables)
@@ -467,7 +467,7 @@ class HybridTableProcessor:
         self.logger.info(f"成功提取 {len(tables)} 个表格")
         return tables
     
-    def _extract_with_advanced_model(self, pdf_path: str) -> List[TableElement]:
+    def _extract_with_advanced_model(self, pdf_path: str, source_ref: Optional[str] = None) -> List[TableElement]:
         """使用高级模型进行表格检测和提取"""
         if not self.table_detection_model:
             return []
@@ -592,7 +592,7 @@ class HybridTableProcessor:
                             quality_score=self._calculate_table_quality(raw_data),
                             extraction_method='detectron2_advanced',
                             metadata={
-                                'source_file': str(pdf_path),
+                                'source_ref': source_ref,
                                 'extraction_time': time.time(),
                                 'model_name': 'detectron2_quantized',
                                 'contains_financial_data': self._contains_financial_data(raw_data),
@@ -618,7 +618,7 @@ class HybridTableProcessor:
         
         return tables
 
-    def _extract_with_doclayout_yolo(self, pdf_path: str) -> List[TableElement]:
+    def _extract_with_doclayout_yolo(self, pdf_path: str, source_ref: Optional[str] = None) -> List[TableElement]:
         """使用 DocLayout-YOLO 进行表格检测并裁剪抽取"""
         if not self.table_detection_model or not is_engine_available('pdfplumber'):
             return []
@@ -695,7 +695,7 @@ class HybridTableProcessor:
                                 quality_score=quality_score,
                                 extraction_method="doclayout_yolo",
                                 metadata={
-                                    "source_file": str(pdf_path),
+                                    "source_ref": source_ref,
                                     "model_name": "doclayout_yolo",
                                     "model_conf": float(conf_val),
                                     "padding_ratio": self.bbox_padding_ratio,
@@ -710,7 +710,7 @@ class HybridTableProcessor:
         
         return tables
     
-    def _extract_with_pdfplumber(self, pdf_path: str) -> List[TableElement]:
+    def _extract_with_pdfplumber(self, pdf_path: str, source_ref: Optional[str] = None) -> List[TableElement]:
         """使用pdfplumber提取表格并保留完整信息"""
         if not is_engine_available('pdfplumber'):
             return []
@@ -721,41 +721,54 @@ class HybridTableProcessor:
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
                     self.logger.debug(f"处理第 {page_num} 页")
+
+                    # 使用 find_tables 获取带 bbox 的表格对象，直接在 bbox 内提取，避免全页回退
+                    page_tables = page.find_tables()
                     
-                    # 提取页面中的所有表格
-                    page_tables = page.extract_tables()
-                    
-                    for table_idx, table_data in enumerate(page_tables):
+                    for table_idx, table_obj in enumerate(page_tables):
+                        table_bbox = getattr(table_obj, "bbox", None)
+                        try:
+                            table_data = table_obj.extract() if hasattr(table_obj, "extract") else []
+                        except Exception as e:
+                            self.logger.debug(f"find_tables extract 失败 (page {page_num}, idx {table_idx}): {e}")
+                            continue
+
                         if not table_data or len(table_data) < 2:
                             continue
-                        
-                        # 清理表格数据
+
                         cleaned_data = self._clean_table_data(table_data)
                         if not cleaned_data:
                             continue
-                        
-                        # 获取表格边界框
-                        table_bbox = self._find_table_bbox(page, cleaned_data)
-                        
-                        # 创建表格元素
+
+                        # 再次基于 bbox 裁剪，确保内容仅来源于表格区域
+                        raw_data = []
+                        content = ""
+                        if table_bbox:
+                            raw_data, content = self._extract_table_by_bbox(page, table_bbox)
+
+                        # 如果 bbox 裁剪失败，跳过该表格，避免回退全页数据
+                        if not raw_data:
+                            continue
+
                         table_elem = TableElement(
-                            content=self._format_table_as_markdown(cleaned_data),
-                            raw_data=cleaned_data,
+                            content=content or self._format_table_as_markdown(cleaned_data),
+                            raw_data=raw_data or cleaned_data,
                             page_number=page_num,
                             bbox=table_bbox,
                             table_index=table_idx,
-                            rows=len(cleaned_data),
-                            cols=len(cleaned_data[0]) if cleaned_data[0] else 0,
-                            has_header=self._detect_header(cleaned_data),
-                            quality_score=self._calculate_table_quality(cleaned_data),
+                            rows=len(raw_data) if raw_data else len(cleaned_data),
+                            cols=len(raw_data[0]) if raw_data and raw_data[0] else (len(cleaned_data[0]) if cleaned_data else 0),
+                            has_header=self._detect_header(raw_data or cleaned_data),
+                            quality_score=self._calculate_table_quality(raw_data or cleaned_data),
                             extraction_method='pdfplumber',
                             metadata={
-                                'source_file': str(pdf_path),
+                                'source_ref': source_ref,
                                 'extraction_time': time.time(),
-                                'contains_financial_data': self._contains_financial_data(cleaned_data)
+                                'contains_financial_data': self._contains_financial_data(raw_data or cleaned_data),
+                                'bbox_used': bool(table_bbox),
                             }
                         )
-                        
+
                         tables.append(table_elem)
                         self.logger.debug(f"提取表格: 第{page_num}页, 索引{table_idx}, "
                                         f"尺寸{table_elem.rows}x{table_elem.cols}")
@@ -765,7 +778,7 @@ class HybridTableProcessor:
         
         return tables
     
-    def _extract_with_unstructured(self, pdf_path: str) -> List[TableElement]:
+    def _extract_with_unstructured(self, pdf_path: str, source_ref: Optional[str] = None) -> List[TableElement]:
         """使用unstructured提取表格（带坐标）"""
         if not is_engine_available('unstructured'):
             return []
@@ -827,7 +840,7 @@ class HybridTableProcessor:
                         quality_score=self._calculate_content_quality(content),
                         extraction_method='unstructured',
                         metadata={
-                            'source_file': str(pdf_path),
+                            'source_ref': source_ref,
                             'element_type': elem.category if hasattr(elem, 'category') else 'table'
                         }
                     )

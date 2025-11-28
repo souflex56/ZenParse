@@ -9,6 +9,10 @@ import logging
 from typing import List, Optional, Dict, Any, Tuple
 from collections import defaultdict
 
+# 表格说明关键词（用于保留单位/项目等非分隔符行）
+_TABLE_HEADER_KEYWORDS = ['单位', '币种', '项目', '科目', '指标', '期间', '日期', '金额', '合计', '小计', '注']
+_TABLE_HEADER_PATTERN = re.compile("|".join(map(re.escape, _TABLE_HEADER_KEYWORDS)))
+
 from .models import DocumentElement, TableGroup, ElementType, TableType
 from .accounting_domain import (
     STANDARD_ACCOUNTING_ITEMS,
@@ -475,8 +479,55 @@ class TableContextIdentifier:
         
         # 移除多余的换行
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+        # 裁掉开头/结尾明显非表格行（但保留常见表头/说明关键词）
+        cleaned = self._trim_non_table_noise(cleaned)
         
         return cleaned.strip()
+
+    def _trim_non_table_noise(self, content: str) -> str:
+        """
+        裁剪表格内容首尾的非表格行，避免把整页正文/目录混入表格。
+        保留常见表头/说明关键词（即使没有分隔符），避免误删“单位/币种/项目”等说明。
+        """
+        if not content:
+            return content
+
+        def is_tableish(line: str) -> bool:
+            if not line or not line.strip():
+                return False
+            if '|' in line or '\t' in line:
+                return True
+            # 多空格分列的行（至少 3 列）
+            if len(re.split(r'\s{2,}', line.strip())) >= 3:
+                return True
+            # 关键字行（单位/币种/项目等）视为表格相关
+            if _TABLE_HEADER_PATTERN.search(line):
+                return True
+            return False
+
+        lines = [l.rstrip() for l in content.split('\n')]
+
+        def trim_block(ls: List[str], from_start: bool = True) -> List[str]:
+            """移除首尾连续 3+ 非表格且非空行，保留空行。"""
+            indices = range(len(ls)) if from_start else range(len(ls) - 1, -1, -1)
+            block: List[int] = []
+            for i in indices:
+                line = ls[i]
+                if line.strip() and not is_tableish(line):
+                    block.append(i)
+                else:
+                    break
+            if len(block) >= 3:
+                # 删除这一段非表格块
+                for idx in sorted(block, reverse=True):
+                    ls.pop(idx)
+            return ls
+
+        lines = trim_block(lines, from_start=True)
+        lines = trim_block(lines, from_start=False)
+
+        return "\n".join(lines) if lines else content
     
     def _generate_markdown(self, group: TableGroup) -> str:
         """生成Markdown格式内容"""

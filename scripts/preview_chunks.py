@@ -66,14 +66,23 @@ def snippet(text: str, length: int = 80) -> str:
     return clean[:length] + ("..." if len(clean) > length else "")
 
 
-def as_row(chunk: Dict[str, Any], idx: int, snip_len: int, layer: str) -> Dict[str, Any]:
+def as_row(chunk: Dict[str, Any], idx: int, snip_len: int, layer: str, sources: Dict[str, Any] = None) -> Dict[str, Any]:
     """Flatten chunk fields for tabular export."""
     meta = chunk.get("metadata") or {}
     pages = meta.get("page_numbers") or []
     bbox = chunk.get("bbox")
+    
+    # Resolve source file - 只使用 source_ref
+    source_ref = meta.get("source_ref")
+    if source_ref and sources and source_ref in sources:
+        source_display = sources[source_ref].get("display_name", source_ref)
+    else:
+        source_display = source_ref or "unknown"
+        
     return {
         "idx": idx,
         "layer": layer,
+        "source": source_display,
         "chunk_id": chunk.get("chunk_id"),
         "chunk_type": chunk.get("chunk_type"),
         "is_table": bool(chunk.get("is_table")) or chunk.get("chunk_type") == "table_group",
@@ -93,12 +102,13 @@ def as_row(chunk: Dict[str, Any], idx: int, snip_len: int, layer: str) -> Dict[s
     }
 
 
-def load_chunks(path: Path) -> Dict[str, List[Dict[str, Any]]]:
+def load_chunks(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     parents = data.get("parents") or []
     children = data.get("children") or []
-    return {"parents": parents, "children": children}
+    sources = data.get("sources") or {}
+    return {"parents": parents, "children": children, "sources": sources}
 
 
 def main() -> None:
@@ -119,6 +129,7 @@ def main() -> None:
     data = load_chunks(path)
     parents_raw = data["parents"]
     children_raw = data["children"]
+    sources = data.get("sources", {})
 
     def _filter(ch: Dict[str, Any], is_parent: bool) -> bool:
         ctype = ch.get("chunk_type")
@@ -143,7 +154,7 @@ def main() -> None:
 
         def _rows(chunks: List[Dict[str, Any]], layer: str) -> List[Dict[str, Any]]:
             end = limit if limit else len(chunks)
-            return [as_row(ch, i, args.snippet_len, layer) for i, ch in enumerate(chunks[:end], 1)]
+            return [as_row(ch, i, args.snippet_len, layer, sources) for i, ch in enumerate(chunks[:end], 1)]
 
         parent_rows = _rows(parents_sorted, "parent")
         child_rows = _rows(children_sorted, "child") if children_sorted else []
@@ -170,7 +181,7 @@ def main() -> None:
         f"children={len(data['children'])} | showing parents={parent_show}/{len(parents_sorted)} "
         f"children={child_show}/{len(children_sorted)}"
     )
-    print("idx\tlayer\tpage\ty0\tpos\ttype\tis_table\tquality\ttext")
+    print("idx\tlayer\tsource\tpage\ty0\tpos\ttype\tis_table\tquality\ttext")
 
     def _print(chunks: List[Dict[str, Any]], layer: str, count: int) -> None:
         for idx, ch in enumerate(chunks[:count], 1):
@@ -180,8 +191,16 @@ def main() -> None:
             y_str = "NA" if y0 is math.inf else f"{y0:.1f}"
             quality = ch.get("quality_score")
             q_str = f"{quality:.2f}" if isinstance(quality, (int, float)) else "NA"
+            # Resolve source for terminal output - 只使用 source_ref
+            meta = ch.get("metadata") or {}
+            source_ref = meta.get("source_ref")
+            if source_ref and sources and source_ref in sources:
+                source_display = sources[source_ref].get("display_name", source_ref)
+            else:
+                source_display = source_ref or "unknown"
+                
             print(
-                f"{idx}\t{layer}\t{page_str}\t{y_str}\t{position(ch)}\t"
+                f"{idx}\t{layer}\t{source_display}\t{page_str}\t{y_str}\t{position(ch)}\t"
                 f"{ch.get('chunk_type')}\t{bool(ch.get('is_table'))}\t{q_str}\t"
                 f"{snippet(ch.get('content', ''), args.snippet_len)}"
             )

@@ -349,7 +349,7 @@ class SmartPDFParser(ChinesePDFParser):
             system_info = self.device_manager.get_system_info()
             self.logger.info(f"SmartPDFParser当前系统状态: 优化设备={system_info.get('optimal_device', 'unknown')}")
     
-    def parse(self, pdf_path: str) -> List[DocumentElement]:
+    def parse(self, pdf_path: str, source_ref: Optional[str] = None) -> List[DocumentElement]:
         """主解析入口 - 两级策略"""
         if not Path(pdf_path).exists():
             raise FileNotFoundError(f"文件不存在: {pdf_path}")
@@ -371,7 +371,7 @@ class SmartPDFParser(ChinesePDFParser):
                     elements = self._parse_with_auto(pdf_path)
                 elif strategy == 'hybrid_table':
                     if hasattr(self, 'table_processor') and self.table_processor:
-                        elements = self._parse_with_hybrid_table(pdf_path)
+                        elements = self._parse_with_hybrid_table(pdf_path, source_ref)
                     else:
                         raise ImportError("混合表格处理器未初始化（请确认在初始化时已根据最终策略启用，或检查依赖是否可用）")
                 elif strategy == 'unstructured':
@@ -599,7 +599,7 @@ class SmartPDFParser(ChinesePDFParser):
         )
         return pdf_type, stats
     
-    def _parse_with_hybrid_table(self, pdf_path: str) -> List[DocumentElement]:
+    def _parse_with_hybrid_table(self, pdf_path: str, source_ref: Optional[str] = None) -> List[DocumentElement]:
         """使用混合表格检测策略解析（优先策略）"""
         if not TABLE_PROCESSOR_AVAILABLE:
             raise ImportError("表格处理器不可用")
@@ -608,7 +608,7 @@ class SmartPDFParser(ChinesePDFParser):
         
         # Step 1: 提取所有表格并保留完整结构
         self.logger.info("Step 1: 使用混合策略提取表格...")
-        tables = self.table_processor.extract_tables(pdf_path)
+        tables = self.table_processor.extract_tables(pdf_path, source_ref)
         
         # 转换表格为文档元素
         table_elements = self.table_processor.convert_to_document_elements(tables)

@@ -4,9 +4,11 @@
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
 
 # 允许直接在仓库根目录执行
@@ -318,6 +320,59 @@ def process_batch(
         file_name = os.path.basename(pdf_path)
         base_name = os.path.splitext(file_name)[0]
         
+        # 生成 source_ref ID 和 相对路径
+        source_ref = f"src-{uuid.uuid4().hex[:8]}"
+        
+        # 优化相对路径计算：优先相对于输入目录或搜索目录
+        relative_path = file_name  # 默认值
+        try:
+            # 收集所有可能的基准目录（输入目录和搜索目录）
+            base_dirs = []
+            for input_path in input_paths:
+                if not input_path:
+                    continue
+                abs_input = os.path.abspath(input_path)
+                if os.path.isdir(abs_input):
+                    base_dirs.append(abs_input)
+                else:
+                    # 如果是文件，使用其父目录
+                    parent_dir = os.path.dirname(abs_input)
+                    if parent_dir:
+                        base_dirs.append(parent_dir)
+            
+            # 添加搜索目录
+            base_dirs.extend(normalized_search_dirs)
+            
+            # 尝试找到文件所在的基准目录
+            for base_dir in base_dirs:
+                try:
+                    rel = os.path.relpath(pdf_path, base_dir)
+                    # 确保文件在目录内（相对路径不以 .. 开头）
+                    if not rel.startswith('..'):
+                        relative_path = rel
+                        break
+                except ValueError:
+                    continue
+            
+            # 如果没找到匹配的目录，尝试相对于当前工作目录
+            if relative_path == file_name:
+                relative_path = os.path.relpath(pdf_path)
+        except ValueError:
+            # 如果无法计算相对路径（例如跨驱动器），使用文件名
+            relative_path = file_name
+        
+        # 使用稳定的哈希算法（MD5）
+        absolute_path_hash = hashlib.md5(pdf_path.encode('utf-8')).hexdigest()
+            
+        source_catalog = {
+            source_ref: {
+                "id": source_ref,
+                "relative_path": relative_path,
+                "display_name": file_name,
+                "absolute_path_hash": absolute_path_hash
+            }
+        }
+        
         # 根据 use_timestamp 参数决定是否添加时间戳
         if use_timestamp:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -333,8 +388,9 @@ def process_batch(
             continue
 
         try:
-            logger.info(f"[{i}/{total}] 处理: {file_name}")
-            parents, children, table_groups = pipeline.process(pdf_path)
+            logger.info(f"[{i}/{total}] 处理: {file_name} (ID: {source_ref})")
+            # 传递 source_ref 给 pipeline
+            parents, children, table_groups = pipeline.process(pdf_path, source_ref=source_ref)
 
             overview = _build_overview(parents, children, table_groups, file_name)
             # 报表级会计准则执行情况（若已计算）
@@ -347,6 +403,7 @@ def process_batch(
 
             result_data = {
                 "source": file_name,
+                "sources": source_catalog,  # 添加源文件目录
                 "overview": overview,
                 "parents": [p.to_dict() for p in parents],
                 "children": [c.to_dict() for c in children],
