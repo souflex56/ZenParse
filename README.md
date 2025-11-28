@@ -238,6 +238,14 @@ output/2020-01-21__...__年度报告_chunks.json
 ```json
 {
   "source": "xxx.pdf",
+  "sources": {
+    "src-xxxxx": {
+      "id": "src-xxxxx",
+      "relative_path": "input/pdfs/xxx.pdf",
+      "display_name": "xxx.pdf",
+      "absolute_path_hash": "b03d552430c51c146201a6d98b18eb25"
+    }
+  },
   "overview": {
     "source_file": "xxx.pdf",
     "counts": {
@@ -270,6 +278,7 @@ output/2020-01-21__...__年度报告_chunks.json
       "chunk_type": "text_group",
       "child_ids": ["efgh5678", "..."],
       "metadata": {
+        "source_ref": "src-xxxxx",
         "page_numbers": [1, 2],
         "char_count": 3521,
         "report_type": "annual_report",
@@ -288,6 +297,10 @@ output/2020-01-21__...__年度报告_chunks.json
       "start_char": 0,
       "end_char": 1200,
       "page_number": 1,
+      "metadata": {
+        "source_ref": "src-xxxxx",
+        "page_numbers": [1]
+      },
       "contains_financial_data": true
     }
   ]
