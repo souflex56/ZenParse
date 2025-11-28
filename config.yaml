@@ -7,6 +7,25 @@ pdf_parsing:
   strategies:
     - hybrid_table
 
+# 表格抽取与高级检测配置
+table_extraction:
+  advanced_model: doclayout_yolo       # doclayout_yolo / detectron2 / none
+  model_path: null                     # 自定义权重路径，null 表示使用默认或从 HuggingFace 下载
+  model_repo: "juliozhao/DocLayout-YOLO-DocStructBench"  # HuggingFace 模型仓库
+  model_filename: "doclayout_yolo_docstructbench_imgsz1024.pt"  # 模型文件名
+  # 其他可选模型：
+  # model_repo: "juliozhao/DocLayout-YOLO-DocLayNet"
+  # model_repo: "juliozhao/DocLayout-YOLO-D4LA"
+  # model_repo: "juliozhao/DocLayout-YOLO-DocSynth300K-pretrain"
+  quality_threshold: 0.65              # 表格质量低于此值触发高级检测
+  detection_conf: 0.30                 # 模型置信度阈值
+  detection_iou: 0.50                  # 模型 NMS IoU 阈值
+  bbox_padding_ratio: 0.02             # YOLO 框裁剪前的扩张比例
+  merge_iou_threshold: 0.55            # 表格去重合并的 IoU 阈值
+  render_dpi: 150                      # 页面渲染 DPI（供检测用）
+  skip_ocr_for_digital: true           # 数字 PDF 跳过 OCR 兜底
+  ocr_trigger_char_threshold: 10       # bbox 内字符数低于此触发 OCR
+
 context:
   context_before: 10
   context_after: 3

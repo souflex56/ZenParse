@@ -1,10 +1,22 @@
+# 基础深度学习框架
+torch
+
+# 依赖 torch 的库
+transformers>=4.41.0,<5.0.0
+ultralytics
+
+# 依赖上述库的包
+doclayout-yolo
+unstructured-inference
+huggingface_hub
+
+# PDF 处理库
 unstructured
 pdfplumber
 pymupdf
-loguru
-torch
-psutil
-opencv-python-headless
+
+# 数据处理和工具库
 pandas
-unstructured-inference
-detectron2
+opencv-python-headless
+psutil
+loguru

@@ -652,6 +652,8 @@ class SmartPDFParser(ChinesePDFParser):
         text_elements: List[DocumentElement] = []
         normalized_type = (pdf_type or "unknown").lower()
         use_ocr = normalized_type == "scanned"
+        table_cfg = self.config.get("table_extraction", {}) if isinstance(self.config, dict) else {}
+        skip_ocr_for_digital = bool(table_cfg.get("skip_ocr_for_digital", False))
         
         # 仅在扫描版或完全没有文本的情况下才跑 OCR（hi_res）
         if use_ocr and is_engine_available('unstructured'):
@@ -789,7 +791,7 @@ class SmartPDFParser(ChinesePDFParser):
                 self.logger.error(f"pdfplumber文本提取失败: {e}")
         
         # 如果仍然没有文本且之前未跑OCR，最后兜底一次OCR
-        if not text_elements and not use_ocr and is_engine_available('unstructured'):
+        if not text_elements and not use_ocr and not skip_ocr_for_digital and is_engine_available('unstructured'):
             self.logger.info("pdfplumber未提取到文本，兜底启用OCR(hi_res)")
             try:
                 partition_elements = partition_pdf(

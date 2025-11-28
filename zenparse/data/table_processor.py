@@ -115,6 +115,16 @@ class HybridTableProcessor:
         
         # 使用共享的引擎检查结果（避免重复检查）
         self.available_engines = get_pdf_engines()
+        table_cfg = self.config.get("table_extraction", {})
+        self.advanced_model = table_cfg.get("advanced_model", "detectron2")
+        self.detection_conf, self.detection_iou = self._resolve_detection_conf_iou()
+        self.table_quality_threshold = self._resolve_table_quality_threshold()
+        self.merge_iou_threshold = self._resolve_merge_iou_threshold()
+        self.bbox_padding_ratio = self._resolve_bbox_padding_ratio()
+        self.render_dpi = self._resolve_render_dpi()
+        self.ocr_trigger_char_threshold = self._resolve_ocr_trigger_char_threshold()
+        self.skip_ocr_for_digital = bool(table_cfg.get("skip_ocr_for_digital", False))
+        self._yolo_device = None
         
         # 简化的初始化日志
         self.logger.info("混合表格处理器初始化完成")
@@ -169,7 +179,105 @@ class HybridTableProcessor:
     
     def _init_advanced_models(self):
         """初始化高级模型 - """
-        if is_engine_available('unstructured') and UNSTRUCTURED_INFERENCE_AVAILABLE:
+        model_choice = (self.advanced_model or "detectron2").lower()
+        if model_choice == "doclayout_yolo":
+            try:
+                from ultralytics import YOLO  # type: ignore
+                self.logger.info("加载 DocLayout-YOLO 模型...")
+                table_cfg = self.config.get("table_extraction", {})
+                model_path = table_cfg.get("model_path")
+                
+                # 如果未指定路径，尝试从 HuggingFace 下载
+                if not model_path:
+                    try:
+                        from huggingface_hub import hf_hub_download
+                        from pathlib import Path
+                        import os
+                        import shutil
+                        
+                        # 默认使用 DocStructBench 模型（通用性好）
+                        model_repo = table_cfg.get("model_repo", "juliozhao/DocLayout-YOLO-DocStructBench")
+                        model_filename = table_cfg.get("model_filename", "doclayout_yolo_docstructbench_imgsz1024.pt")
+                        
+                        # 创建模型缓存目录
+                        cache_dir = Path.home() / ".cache" / "zenparse" / "models"
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        local_model_path = cache_dir / model_filename
+                        
+                        # 如果本地不存在，则从 HuggingFace 下载
+                        if not local_model_path.exists():
+                            self.logger.info(f"从 HuggingFace 下载模型: {model_repo}/{model_filename}")
+                            try:
+                                downloaded_path = hf_hub_download(
+                                    repo_id=model_repo,
+                                    filename=model_filename,
+                                    local_dir=str(cache_dir),
+                                    local_dir_use_symlinks=False
+                                )
+                                # 确保文件存在
+                                if downloaded_path and os.path.exists(downloaded_path):
+                                    if os.path.basename(downloaded_path) != model_filename:
+                                        # 如果文件名不同，复制到标准名称
+                                        shutil.copy2(downloaded_path, str(local_model_path))
+                                        model_path = str(local_model_path)
+                                    else:
+                                        model_path = downloaded_path
+                                else:
+                                    raise FileNotFoundError(f"下载的模型文件不存在: {downloaded_path}")
+                            except Exception as e:
+                                self.logger.warning(f"从 HuggingFace 下载失败: {e}")
+                                # 尝试其他可能的文件名
+                                alternative_filenames = [
+                                    "best.pt",
+                                    "yolov8_doclayout.pt",
+                                    "doclayout_yolo.pt",
+                                ]
+                                downloaded = False
+                                for alt_filename in alternative_filenames:
+                                    try:
+                                        alt_path = hf_hub_download(
+                                            repo_id=model_repo,
+                                            filename=alt_filename,
+                                            local_dir=str(cache_dir),
+                                            local_dir_use_symlinks=False
+                                        )
+                                        if alt_path and os.path.exists(alt_path):
+                                            model_path = alt_path
+                                            downloaded = True
+                                            self.logger.info(f"成功下载模型: {alt_filename}")
+                                            break
+                                    except Exception:
+                                        continue
+                                
+                                if not downloaded:
+                                    raise FileNotFoundError(f"无法从 {model_repo} 下载模型文件")
+                        else:
+                            model_path = str(local_model_path)
+                            self.logger.info(f"使用缓存的模型: {model_path}")
+                    except ImportError:
+                        self.logger.warning("huggingface_hub 未安装，无法自动下载模型。请安装: pip install huggingface_hub")
+                        raise
+                    except Exception as e:
+                        self.logger.warning(f"模型下载/加载失败: {e}")
+                        raise
+                
+                # 加载模型
+                self.table_detection_model = YOLO(model_path)
+                try:
+                    import torch  # type: ignore
+                    if torch.cuda.is_available():
+                        self._yolo_device = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        self._yolo_device = "mps"
+                    else:
+                        self._yolo_device = "cpu"
+                except Exception:
+                    self._yolo_device = "cpu"
+                self.logger.info(f"✅ DocLayout-YOLO 加载成功，device={self._yolo_device}, model={model_path}")
+            except Exception as e:
+                self.logger.warning(f"DocLayout-YOLO 加载失败，回退基础策略: {e}")
+                self.table_detection_model = None
+        elif model_choice == "detectron2" and is_engine_available('unstructured') and UNSTRUCTURED_INFERENCE_AVAILABLE:
             try:
                 self.logger.info("尝试加载高级表格检测模型...")
                 
@@ -234,32 +342,127 @@ class HybridTableProcessor:
         
         return 0.3
     
+    def _resolve_detection_conf_iou(self) -> Tuple[float, float]:
+        table_cfg = self.config.get("table_extraction", {})
+        conf = table_cfg.get("detection_conf", 0.3)
+        iou = table_cfg.get("detection_iou", 0.5)
+        try:
+            return float(conf), float(iou)
+        except Exception:
+            return 0.3, 0.5
+    
+    def _resolve_merge_iou_threshold(self) -> float:
+        table_cfg = self.config.get("table_extraction", {})
+        try:
+            return float(table_cfg.get("merge_iou_threshold", 0.55))
+        except Exception:
+            return 0.55
+    
+    def _resolve_bbox_padding_ratio(self) -> float:
+        table_cfg = self.config.get("table_extraction", {})
+        try:
+            return float(table_cfg.get("bbox_padding_ratio", 0.02))
+        except Exception:
+            return 0.02
+    
+    def _resolve_render_dpi(self) -> int:
+        table_cfg = self.config.get("table_extraction", {})
+        try:
+            return int(table_cfg.get("render_dpi", 150))
+        except Exception:
+            return 150
+    
+    def _resolve_ocr_trigger_char_threshold(self) -> int:
+        table_cfg = self.config.get("table_extraction", {})
+        try:
+            return int(table_cfg.get("ocr_trigger_char_threshold", 10))
+        except Exception:
+            return 10
+    
+    def _resolve_table_quality_threshold(self) -> float:
+        """
+        获取表格质量阈值，用于决定是否触发补充检测。
+        优先级：
+        table_extraction.quality_threshold
+        → document_processing.quality_filtering.min_table_quality
+        → 默认 0.65
+        """
+        candidate_paths = [
+            ('table_extraction', 'quality_threshold'),
+            ('data', 'table_extraction', 'quality_threshold'),
+            ('document_processing', 'quality_filtering', 'min_table_quality'),
+            ('data', 'document_processing', 'quality_filtering', 'min_table_quality'),
+        ]
+        for path in candidate_paths:
+            value = self._get_nested_config_value(self.config, path)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                joined = ".".join(path)
+                self.logger.warning(f"表格质量阈值配置无效 ({joined}={value})，尝试下一个候选值")
+        return 0.65
+    
     def extract_tables(self, pdf_path: str) -> List[TableElement]:
-        """从PDF中提取所有表格"""
+        """从PDF中提取所有表格（质量分级：先pdfplumber，高质量则直接用，低质再补模型）"""
         if not Path(pdf_path).exists():
             raise FileNotFoundError(f"文件不存在: {pdf_path}")
         
         self.logger.info(f"开始提取表格: {pdf_path}")
+        quality_threshold = self._resolve_table_quality_threshold()
         
-        # 策略1：优先使用高级模型（如果可用）
-        if self.table_detection_model:
-            self.logger.info("使用高级模型进行表格检测")
-            tables = self._extract_with_advanced_model(pdf_path)
-        else:
-            tables = []
+        tables: List[TableElement] = []
+        plumber_tables: List[TableElement] = []
+        needs_advanced = False
         
-        # 策略2：如果高级模型不可用或效果不好，使用pdfplumber
-        if not tables and is_engine_available('pdfplumber'):
-            self.logger.info("使用pdfplumber提取表格")
-            tables = self._extract_with_pdfplumber(pdf_path)
+        # 首先用 pdfplumber 覆盖全页（数字版最快）
+        if is_engine_available('pdfplumber'):
+            self.logger.info("使用pdfplumber提取表格（首选路径）")
+            plumber_tables = self._extract_with_pdfplumber(pdf_path)
+            tables.extend(plumber_tables)
+            
+            if plumber_tables:
+                low_quality = [
+                    t for t in plumber_tables
+                    if self._is_low_quality_table(t, quality_threshold)
+                ]
+                if low_quality:
+                    needs_advanced = True
+                    self.logger.info(
+                        f"检测到 {len(low_quality)} 个低质量表格，触发补充检测（阈值={quality_threshold}）"
+                    )
+            else:
+                # 缺表页触发补充检测
+                needs_advanced = True
+                self.logger.info("pdfplumber 未发现表格，尝试补充检测")
         
-        # 策略3：如果pdfplumber效果不好，尝试unstructured
+        # 补充：仅在需要时调用高级模型（或其他检测器）
+        if needs_advanced:
+            model_choice = (self.advanced_model or "").lower()
+            if model_choice == "doclayout_yolo" and self.table_detection_model:
+                self.logger.info("使用 DocLayout-YOLO 对低质量/缺失页面补充检测")
+                advanced_tables = self._extract_with_doclayout_yolo(pdf_path)
+                tables = self._merge_tables(plumber_tables, advanced_tables)
+            elif self.table_detection_model:
+                self.logger.info("使用高级模型对低质量/缺失页面补充检测")
+                advanced_tables = self._extract_with_advanced_model(pdf_path)
+                tables = self._merge_tables(plumber_tables, advanced_tables)
+            elif is_engine_available('unstructured'):
+                self.logger.info("表格低质量，使用unstructured补充检测")
+                extra_tables = self._extract_with_unstructured(pdf_path)
+                tables = self._merge_tables(plumber_tables, extra_tables)
+        
+        # 最后兜底：仍然没有表格时尝试 unstructured
         if not tables and is_engine_available('unstructured'):
-            self.logger.info("尝试使用unstructured提取表格")
+            self.logger.info("尝试使用unstructured提取表格（兜底）")
             tables.extend(self._extract_with_unstructured(pdf_path))
         
         # 后处理：增强表格质量
         tables = self._enhance_tables(tables)
+        
+        # 页内排序，保持阅读顺序
+        tables.sort(key=lambda t: (t.page_number, t.bbox[1] if t.bbox else 0))
         
         self.logger.info(f"成功提取 {len(tables)} 个表格")
         return tables
@@ -269,6 +472,7 @@ class HybridTableProcessor:
         if not self.table_detection_model:
             return []
         
+        # detectron2 路径（保留原有行为）
         tables = []
         
         try:
@@ -413,6 +617,98 @@ class HybridTableProcessor:
             # 如果高级模型失败，返回空列表，让后续策略接管
         
         return tables
+
+    def _extract_with_doclayout_yolo(self, pdf_path: str) -> List[TableElement]:
+        """使用 DocLayout-YOLO 进行表格检测并裁剪抽取"""
+        if not self.table_detection_model or not is_engine_available('pdfplumber'):
+            return []
+        
+        tables: List[TableElement] = []
+        try:
+            import pdfplumber
+        except Exception as e:
+            self.logger.error(f"加载pdfplumber失败: {e}")
+            return tables
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_index, page in enumerate(pdf.pages):
+                    # 若 pdfplumber 本身已有表格且质量足够，可跳过；这里仅在调用方触发时补充全页检测
+                    try:
+                        page_img = page.to_image(resolution=self.render_dpi).original
+                    except Exception as e:
+                        self.logger.debug(f"页面渲染失败，第{page_index+1}页: {e}")
+                        continue
+                    
+                    results = self.table_detection_model.predict(
+                        source=page_img,
+                        conf=self.detection_conf,
+                        iou=self.detection_iou,
+                        device=self._yolo_device or "cpu",
+                        verbose=False,
+                    )
+                    if not results:
+                        continue
+                    
+                    # 获取类别映射，确认 table 类别
+                    names = getattr(results[0], "names", {}) or {}
+                    table_class_ids = [cid for cid, name in names.items() if str(name).lower() == "table"]
+                    if not table_class_ids:
+                        # DocLayout-YOLO 默认 table 类别为 5
+                        table_class_ids = [5]
+                    
+                    img_w, img_h = page_img.size
+                    for box, cls_id, conf_val in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
+                        if int(cls_id) not in table_class_ids:
+                            continue
+                        x0, y0, x1, y1 = [float(v) for v in box.tolist()]
+                        # padding
+                        pad_w = (x1 - x0) * self.bbox_padding_ratio
+                        pad_h = (y1 - y0) * self.bbox_padding_ratio
+                        x0 = max(0.0, x0 - pad_w)
+                        y0 = max(0.0, y0 - pad_h)
+                        x1 = min(img_w, x1 + pad_w)
+                        y1 = min(img_h, y1 + pad_h)
+                        
+                        pdf_bbox = self._map_bbox_pixels_to_pdf((x0, y0, x1, y1), img_w, img_h, page.width, page.height)
+                        raw_data, content = self._extract_table_by_bbox(page, pdf_bbox)
+                        
+                        rows = len(raw_data) if raw_data else 0
+                        cols = len(raw_data[0]) if raw_data and raw_data[0] else 0
+                        text_len = 0
+                        if raw_data:
+                            text_len = len("".join([c for row in raw_data for c in row if c]))
+                        elif content:
+                            text_len = len(content)
+                        quality_score = self._calculate_table_quality(raw_data) if raw_data else self._calculate_content_quality(content)
+                        needs_ocr = text_len < self.ocr_trigger_char_threshold
+                        tables.append(
+                            TableElement(
+                                content=content,
+                                raw_data=raw_data or [],
+                                page_number=page_index + 1,
+                                bbox=pdf_bbox,
+                                table_index=len(tables),
+                                rows=rows,
+                                cols=cols,
+                                has_header=self._detect_header(raw_data) if raw_data else False,
+                                quality_score=quality_score,
+                                extraction_method="doclayout_yolo",
+                                metadata={
+                                    "source_file": str(pdf_path),
+                                    "model_name": "doclayout_yolo",
+                                    "model_conf": float(conf_val),
+                                    "padding_ratio": self.bbox_padding_ratio,
+                                    "detection_conf": self.detection_conf,
+                                    "detection_iou": self.detection_iou,
+                                    "needs_ocr": needs_ocr,
+                                },
+                            )
+                        )
+        except Exception as e:
+            self.logger.error(f"DocLayout-YOLO 提取失败: {e}")
+        
+        return tables
     
     def _extract_with_pdfplumber(self, pdf_path: str) -> List[TableElement]:
         """使用pdfplumber提取表格并保留完整信息"""
@@ -542,6 +838,93 @@ class HybridTableProcessor:
             self.logger.error(f"unstructured提取失败: {e}")
         
         return tables
+    
+    def _is_low_quality_table(self, table: TableElement, threshold: float) -> bool:
+        """判定表格是否低质量，需要补充检测"""
+        if not table:
+            return True
+        if table.quality_score < threshold:
+            return True
+        if not table.raw_data or table.rows < 2 or table.cols < 2:
+            return True
+        return False
+    
+    def _merge_tables(
+        self,
+        base: List[TableElement],
+        extra: List[TableElement],
+    ) -> List[TableElement]:
+        """合并表格列表，避免重复，保留高质量版本"""
+        if not base:
+            return extra or []
+        if not extra:
+            return base
+        
+        merged = list(base)
+        for new_table in extra:
+            if not new_table:
+                continue
+            is_duplicate = False
+            for idx, old_table in enumerate(list(merged)):
+                if old_table.page_number != new_table.page_number:
+                    continue
+                if old_table.bbox and new_table.bbox:
+                    overlap = self._bbox_iou(old_table.bbox, new_table.bbox)
+                    if overlap > self.merge_iou_threshold:
+                        is_duplicate = True
+                        if new_table.quality_score > old_table.quality_score:
+                            merged[idx] = new_table
+                        break
+            if not is_duplicate:
+                merged.append(new_table)
+        return merged
+    
+    @staticmethod
+    def _bbox_iou(b1: Tuple[float, float, float, float], b2: Tuple[float, float, float, float]) -> float:
+        """计算两个bbox的IoU"""
+        try:
+            x1 = max(b1[0], b2[0])
+            y1 = max(b1[1], b2[1])
+            x2 = min(b1[2], b2[2])
+            y2 = min(b1[3], b2[3])
+            inter_w = max(0.0, x2 - x1)
+            inter_h = max(0.0, y2 - y1)
+            inter = inter_w * inter_h
+            area1 = max(0.0, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+            area2 = max(0.0, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+            union = area1 + area2 - inter if (area1 + area2 - inter) > 0 else 1e-6
+            return inter / union
+        except Exception:
+            return 0.0
+    
+    @staticmethod
+    def _map_bbox_pixels_to_pdf(bbox_px: Tuple[float, float, float, float], img_w: float, img_h: float,
+                                page_w: float, page_h: float) -> Tuple[float, float, float, float]:
+        """将像素坐标系的bbox映射到PDF坐标系"""
+        if img_w <= 0 or img_h <= 0 or page_w <= 0 or page_h <= 0:
+            return bbox_px
+        scale_x = img_w / page_w
+        scale_y = img_h / page_h
+        x0, y0, x1, y1 = bbox_px
+        return (x0 / scale_x, y0 / scale_y, x1 / scale_x, y1 / scale_y)
+    
+    def _extract_table_by_bbox(self, page, bbox: Tuple[float, float, float, float]) -> Tuple[List[List[str]], str]:
+        """在指定bbox内用pdfplumber抽取表格内容，返回raw_data和markdown内容"""
+        raw_data: List[List[str]] = []
+        content = ""
+        try:
+            cropped = page.crop(bbox)
+            tables = cropped.extract_tables()
+            if tables:
+                cleaned = self._clean_table_data(tables[0])
+                raw_data = cleaned
+                content = self._format_table_as_markdown(cleaned)
+            else:
+                text = cropped.extract_text() or ""
+                content = text.strip()
+        except Exception as e:
+            self.logger.debug(f"bbox提取失败: {e}")
+        return raw_data, content
     
     def _clean_table_data(self, table_data: List[List]) -> List[List]:
         """清理表格数据"""
